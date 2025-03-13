@@ -1,12 +1,12 @@
 from dataclasses import dataclass
 from typing import List
 
-from penquest_pkgs.model.slot_info import SlotInfo
+from penquest_pkgs.model import SlotInfoModel
 
 
 @dataclass()
-class ScenarioTeaser():
-    id :str
-    name :str
-    description :str
-    availableSlots :List[SlotInfo]
+class ScenarioTeaserModel():
+    id: str
+    name: str
+    description: str
+    available_slots: List[SlotInfoModel]

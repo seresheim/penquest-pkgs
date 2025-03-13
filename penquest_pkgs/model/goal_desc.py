@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 
 @dataclass
-class GoalDesc():
-    id :str
-    description :str
-    isDefault :bool
+class GoalDescModel():
+    id: str
+    description: str
+    is_default: bool

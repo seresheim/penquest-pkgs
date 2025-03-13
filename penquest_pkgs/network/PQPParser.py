@@ -93,6 +93,9 @@ class PQPParser():
         for elem in l:
             if type(elem) == dict:
                 new_elem = self.parse_message(elem, dtype)
+            elif type(elem) == list:
+                dtype = dtype.__args__[0]
+                new_elem = self._parse_list(elem, dtype)
             else:
                 new_elem = dtype(elem)
             new_list.append(new_elem)
@@ -122,7 +125,7 @@ class PQPParser():
 
         for field_name, field_type in dtype.__dict__.items():
             if not field_name.startswith("__"):
-                get_logger(__name__).log(5, f"parsing field '{field_name}' to designated type '{field_type.dtype}'")
+                get_logger(__name__).log(4, f"parsing field '{field_name}' to designated type '{field_type.dtype}'")
                 # Raise error for fields that are required in a message but not
                 # present; missing optional fields are set to None
                 if isinstance(field_type.dtype, ForwardRef):
@@ -133,8 +136,8 @@ class PQPParser():
                 if field_name not in message:
                     if isinstance(field_type, Required):
                         raise ValueError(
-                            f"Message does not contain required field "
-                            f"'{field_name}'"
+                            f"Message for object {dtype} does not contain "
+                            f"required field '{field_name}'"
                         )
                     if isinstance(field_type, Optional):
                         setattr(obj, field_name, None)
@@ -219,5 +222,5 @@ class PQPParser():
                 # set value of the object attribute with the corresponding field
                 # name
                 setattr(obj, field_name, message_value)
-        get_logger(__name__).log(5, f"parsed object: {obj.__dict__}")
+        get_logger(__name__).log(4, f"parsed object: {obj.__dict__}")
         return obj

@@ -31,7 +31,8 @@ class EventBasedObject:
 
     async def await_event(self, event_or_events: Union[str, List[str]], timeout: Optional[float] = 30):
         """
-        Awaits an event
+        Awaits until either a single event or one of multiple events is received
+
         :param event: str - Event to await
         :param timeout: float - Timeout in seconds
         :return: Any - Return value of the event listener
@@ -50,6 +51,50 @@ class EventBasedObject:
         try:
             return await asyncio.wait_for(reply, timeout)
         except asyncio.TimeoutError:
-            raise asyncio.TimeoutError(f"Timeout reached while waiting for event: {', '.join(event_or_events)}")
+            raise asyncio.TimeoutError(
+                f"Timeout reached while waiting for event: "
+                f"{', '.join(event_or_events)}"
+            )
         finally:
             self.event_listener.remove(listener)
+
+    async def await_events(
+            self, 
+            events: List[str], 
+            timeout: Optional[float]=30
+        ):
+        """Awaits multiple events after each other. The order of the events is
+        important as events have to appear in the order as they are given to
+        this function and 'a little' time needs to appear between them.
+
+        :param events: _description_
+        :param timeout: _description_, defaults to 30
+        """
+        # 'a little time' is requried between the events in order for asyncio
+        # this corouting again.
+        replies = []
+        event_listeners = {}
+
+
+        for event in events:
+            reply = asyncio.Future()
+            replies.append(reply)
+            async def listener(_event, _data):
+                if _event not in [event]: return False, None
+                reply.set_result(_data)
+                return True, None 
+            self.event_listener.append(listener)
+            event_listeners[event] = listener
+
+        try:
+            ret_value = None
+            for event, reply in zip(events, replies):
+                ret_value = await asyncio.wait_for(reply, timeout)
+        except asyncio.TimeoutError:
+            raise asyncio.TimeoutError(
+                f"Timeout reached while waiting for event: '{event}'"
+            )
+        finally:
+            for event in events:
+                self.event_listener.remove(event_listeners[event])
+            return ret_value

@@ -1,8 +1,8 @@
 from typing import List, Dict
 from dataclasses import dataclass
 
-from penquest_pkgs.model.game_options import GameOptions
 import penquest_pkgs.network.game_messages.message_models as mm
+from penquest_pkgs.model import GameOptionsModel
 
 
 def dataclass_to_dict(instance):
@@ -22,21 +22,22 @@ def dataclass_to_dict(instance):
 @dataclass()
 class OutboundMessage():
     
-    def __init__(self, **kwargs):
+    def __init__(self):
         pass
 
 @dataclass()
 class JoinLobbyMessage(OutboundMessage):
     code: str
+    slot: int = None
 
 @dataclass()
 class PlayersChangedMessage(OutboundMessage):
-    players: Dict[int, mm.Player]
+    players: Dict[int, mm.PlayerMessageModel]
 
 
 @dataclass()
 class LobbyChangedMessage(OutboundMessage):
-    lobby: mm.Lobby
+    lobby: mm.LobbyMessageModel
 
 @dataclass()
 class SetSeedMessage(OutboundMessage):
@@ -56,7 +57,7 @@ class SelectScenarioMessage(OutboundMessage):
 
 @dataclass()
 class UpdateGameOptionsMessage(OutboundMessage):
-    game_options: GameOptions
+    options: GameOptionsModel
 
 
 @dataclass()
@@ -82,7 +83,7 @@ class GetValidActionsMessage(OutboundMessage):
 
 @dataclass()
 class SelectActionsMessage(OutboundMessage):
-    action_ids: List[int]
+    actions: List[mm.SelectedActionMessageModel]
 
 
 @dataclass()

@@ -4,8 +4,28 @@ from typing import Any, Dict, TypeVar, Union
 
 import penquest_pkgs.network.game_messages.inbound as InboundMessages
 from penquest_pkgs.network.PQPParser import PQPParser
-from penquest_pkgs.utils.logging import get_logger
 from penquest_pkgs.utils.ios import parse_stream, parse_queue
+from penquest_pkgs.constants import GameStoragePhase
+from penquest_pkgs.mappers.inbound_mappers import(
+    DefaultMapper,
+    LobbyInfoMapper,
+    ScenariosMapper,
+    ScenarioChangedMapper,
+    GameOptionsChangedMapper,
+    PlayerMessageMapper,
+    GameMessageMapper,
+    EquipmentTemplatesMessageMapper,
+    EquipmentsMessageMapper,
+    ActionPlayableMapper,
+    ActionMessageMapper,
+    ActionsMessageMapper,
+    ActionTemplatesMessageMapper,
+    AssetMessageMapper,
+    AssetChangesMessageMapper,
+    GameEndedMapper,
+    EventLogUpdateMapper,
+    ErrorsMapper,
+)
 
 
 T = TypeVar('T')
@@ -55,6 +75,7 @@ class InputEvents:
     EVENTLOG_UPDATED            = 'eventlog_updated'
     REMOVE_EQUIPMENT_FROM_SHOP  = 'remove_equipment_from_shop'      # Sends a list of equipment ids to remove from the shop
     ACTOR_DETECTED              = 'actor_detected'          # Event to set 'hasBeenDetected' attribute for actors
+    ACTION_POINTS_CHANGED       = 'action_points_changed'   # Event to set the action points of a player
 
     ALL_ACTIONS_PLAYABLE        = 'all_actions_playable'    # Reply from the backend that contains all actions that are playable
 
@@ -64,7 +85,6 @@ class InputEvents:
 
 EVENT_MESSAGE_MAPPING = {
     InputEvents.NEW_CONNECTION_ID: InboundMessages.NewConnectionIDMessage,
-
     InputEvents.LOBBY_INFO: InboundMessages.LobbyInfoMessage,
     InputEvents.PLAYER_ENTERED: InboundMessages.PlayerEnteredMessage,
     InputEvents.PLAYER_LEFT: InboundMessages.PlayerLeftMessage,
@@ -75,7 +95,6 @@ EVENT_MESSAGE_MAPPING = {
     InputEvents.CHANGE_SLOTS: InboundMessages.ChangeSlotsMessage,
     InputEvents.LOBBY_LEFT: InboundMessages.LobbyLeftMessage,
     InputEvents.GAME_CRASHED: InboundMessages.GameCrashedMessage,
-    
     InputEvents.GAME_STARTED: InboundMessages.GameStartedMessage,
     InputEvents.GAME_PHASE_CHANGED: InboundMessages.GamePhaseChangedMessage,
     InputEvents.ATTRIBUTE_CHANGED: InboundMessages.AttributeChangedMessage,
@@ -89,7 +108,6 @@ EVENT_MESSAGE_MAPPING = {
     InputEvents.ACTIONS_RECEIVED: InboundMessages.ActionsReceivedMessage,
     InputEvents.ASSET_CHANGED: InboundMessages.AssetChangedMessage,
     InputEvents.ASSET_CHANGES: InboundMessages.AssetChangesMessage,
-    InputEvents.REMOVE_CARDS: InboundMessages.RemoveCardsMessage,
     InputEvents.GAME_TURN_CHANGED: InboundMessages.GameTurnChangedMessage,
     InputEvents.UPDATE_PLAYER: InboundMessages.UpdatePlayerMessage,
     InputEvents.GOT_KICKED: InboundMessages.GotKickedMessage,
@@ -100,9 +118,48 @@ EVENT_MESSAGE_MAPPING = {
     InputEvents.EVENTLOG_UPDATED: InboundMessages.EventLogUpdatedMessage,
     InputEvents.REMOVE_EQUIPMENT_FROM_SHOP: InboundMessages.RemoveEquipmentFromShopMessage,
     InputEvents.ACTOR_DETECTED: InboundMessages.ActorDetectedMessage,
-
+    InputEvents.ACTION_POINTS_CHANGED: InboundMessages.ActionPointsChangedMessage,
     InputEvents.ALL_ACTIONS_PLAYABLE: InboundMessages.AllActionsPlayableMessage,
     InputEvents.ERROR: InboundMessages.Errors
+}
+
+EVENT_MAPPERS = {
+    InputEvents.NEW_CONNECTION_ID: DefaultMapper,
+    InputEvents.LOBBY_INFO: LobbyInfoMapper,
+    InputEvents.PLAYER_ENTERED: PlayerMessageMapper,
+    InputEvents.PLAYER_LEFT: PlayerMessageMapper,
+    InputEvents.SCENARIOS: ScenariosMapper,
+    InputEvents.SCENARIO_CHANGED: ScenarioChangedMapper,
+    InputEvents.GAME_OPTIONS_CHANGED: GameOptionsChangedMapper,
+    InputEvents.PLAYER_READY_CHANGED: PlayerMessageMapper,
+    InputEvents.CHANGE_SLOTS: DefaultMapper,
+    InputEvents.LOBBY_LEFT: PlayerMessageMapper,
+    InputEvents.GAME_CRASHED: DefaultMapper,
+    InputEvents.GAME_STARTED: GameMessageMapper,
+    InputEvents.GAME_PHASE_CHANGED: DefaultMapper,
+    InputEvents.ATTRIBUTE_CHANGED: DefaultMapper,
+    InputEvents.ASSORTMENT_RECEIVED: EquipmentTemplatesMessageMapper,
+    InputEvents.EQUIPMENT_RECEIVED: EquipmentsMessageMapper,
+    InputEvents.ACTION_PLAYABLE: ActionPlayableMapper,
+    InputEvents.REMOVE_CARDS: DefaultMapper,
+    InputEvents.ACTIONS_DETECTED: ActionsMessageMapper,
+    InputEvents.ACTION_SUCCESS: ActionMessageMapper,
+    InputEvents.OFFER_SELECTION: ActionTemplatesMessageMapper,
+    InputEvents.ACTIONS_RECEIVED: ActionsMessageMapper,
+    InputEvents.ASSET_CHANGED: AssetMessageMapper,
+    InputEvents.ASSET_CHANGES: AssetChangesMessageMapper,
+    InputEvents.GAME_TURN_CHANGED: DefaultMapper,
+    InputEvents.UPDATE_PLAYER: PlayerMessageMapper,
+    InputEvents.GOT_KICKED: DefaultMapper,
+    InputEvents.GAME_PLAYER_CHANGED: PlayerMessageMapper,
+    InputEvents.GAME_STATE: GameMessageMapper,
+    InputEvents.GAME_ENDED: GameEndedMapper,
+    InputEvents.GAME_LEFT: DefaultMapper,
+    InputEvents.EVENTLOG_UPDATED: EventLogUpdateMapper,
+    InputEvents.REMOVE_EQUIPMENT_FROM_SHOP: DefaultMapper,
+    InputEvents.ACTOR_DETECTED: DefaultMapper,
+    InputEvents.ACTION_POINTS_CHANGED: DefaultMapper,
+    InputEvents.ERROR: ErrorsMapper,
 }
 
 NON_PARSABLE_MESSAGES = {
@@ -124,20 +181,34 @@ class GameInputInterpreter:
     """
 
 
-    def __init__(self, msg_channel: Union[asyncio.StreamReader, asyncio.Queue], game = None):
-        if isinstance(msg_channel, asyncio.StreamReader):
-            msg_channel = parse_stream(msg_channel)
-        elif isinstance(msg_channel, asyncio.Queue):
-            msg_channel = parse_queue(msg_channel)
-        self.msg_channel = msg_channel
+    def __init__(
+            self, 
+            input_channel: Union[asyncio.StreamReader, asyncio.Queue], 
+            game = None
+        ):
+        """Initializes the input interpreter 
+        """
+        if isinstance(input_channel, asyncio.StreamReader):
+            input_channel = parse_stream(input_channel)
+        elif isinstance(input_channel, asyncio.Queue):
+            input_channel = parse_queue(input_channel)
+        self.input_channel = input_channel
         self.listening_job = None
         self.set_game(game)
 
     def set_game(self, game):
+        """Set the game instance that should be used for the input interpreter
+
+        :param game: game instance that is set
+        """
         self.game = game
+
         if game is None: 
             self.events = {}
             return
+        
+        # Cannot import Game due to circular import (maybe the overall 
+        # archtiecture should be changed)
         self.events = {
             # Connection Events
             InputEvents.NEW_CONNECTION_ID: self.game.set_connection_id,
@@ -161,7 +232,6 @@ class GameInputInterpreter:
             InputEvents.ASSORTMENT_RECEIVED: self.game.input.set_assortment,
             InputEvents.EQUIPMENT_RECEIVED: self.game.input.add_equipment,
             InputEvents.GAME_PHASE_CHANGED: self.game.input.set_game_phase,
-            InputEvents.ALL_ACTIONS_PLAYABLE: self.game.input.set_all_actions_playable,
             InputEvents.ACTION_SUCCESS: self.game.input.played_action_reply,
             InputEvents.ACTIONS_DETECTED: self.game.input.add_actions_detected_event,
             InputEvents.ASSET_CHANGED: self.game.input.update_asset,
@@ -175,7 +245,10 @@ class GameInputInterpreter:
             InputEvents.GAME_STATE: self.game.input.update_game_state,
             InputEvents.GAME_ENDED: self.game.input.game_ended,
             InputEvents.GAME_LEFT: self.game.input.game_left,
-            InputEvents.REMOVE_EQUIPMENT_FROM_SHOP: self.game.remove_equipment_from_shop,
+            InputEvents.REMOVE_EQUIPMENT_FROM_SHOP: self.game.input.remove_equipment_from_shop,
+            InputEvents.ACTOR_DETECTED: self.game.input.actor_detected,
+            InputEvents.ACTION_POINTS_CHANGED: self.game.input.action_points_changed,
+            InputEvents.EVENTLOG_UPDATED: self.game.do_nothing,
 
             # Other Events
             InputEvents.ERROR: self.game.input.error,
@@ -184,7 +257,7 @@ class GameInputInterpreter:
         
 
     # Game Input Interpreter
-    async def interpret(self, msg: Dict[str, Any]):
+    def interpret(self, msg: Dict[str, Any]):
         """Interpret the messages that came from the network and 
         call the corresponding methods
 
@@ -195,54 +268,77 @@ class GameInputInterpreter:
 
         event = msg.get('event', None)
         data = msg.get("data", {})
+        message_obj = object()
 
         if event is None: 
             return
         elif event in EVENT_MESSAGE_MAPPING:
-            message_obj = parser.parse_message(
-                data, 
-                EVENT_MESSAGE_MAPPING[event]
-            )
-            message_dict = {
-                key: value 
-                for key, value in message_obj.__dict__.items() 
-                if not key.startswith("__")
-            }
+            try:
+                message_obj = parser.parse_message(
+                    data, 
+                    EVENT_MESSAGE_MAPPING[event]
+                )
+            except Exception as e:
+                logger = self.game.logger
+                logger.error(f"Error while parsing event '{event}': {e}")
+                traceback.print_exc()
         elif event in NON_PARSABLE_MESSAGES:
-            message_dict = {}
+            message_obj = object()
         else:
-            logger = get_logger(__name__)
+            logger = self.game.logger
             logger.warning(
                 f"Unknown event '{event}' received. With data: {data}"
             )
-        get_logger(__name__).debug(f"handle {event} message")
+        self.game.logger.debug(f"handle {event} message")
         # Create a separate task for each message handling, because then
         # messages can await for the arrival of other messages first. Otherwise
         # the single task that handles all messages is blocked by the waiting
         # message and the other incoming message that is waited for is stuck.
+        task = asyncio.create_task(
+            self.new_task_intro(event, message_obj)
+        )
+        current_name = task.get_name().split("-")
+        task.set_name(f"Task-{current_name[-1]}({event})")
+
+    async def new_task_intro(self, event: str,  message_obj: InboundMessages.InboundMessage):
+        """This is the intro for all handling routine tasks. It's purpose is to
+        catch all exceptions that are thrown in the handling routine and log
+        them. This is necessary because otherwise the task would be cancelled
+        and the exception would be lost.
+
+        :param event: name of the event that needs handling
+        :param message_dict: message that should be handled
+        """
         try:
+            mapped_message = EVENT_MAPPERS[event].map(message_obj)
+            mapped_message_dict = {
+                    key: value 
+                    for key, value in mapped_message.__dict__.items() 
+                    if not key.startswith("__")
+                }
             handling_coroutine = self.events.get(event, self.game.do_nothing)
-            asyncio.create_task(handling_coroutine(**message_dict))
+            await handling_coroutine(**mapped_message_dict)
+        except asyncio.CancelledError:
+            if self.game.phase == GameStoragePhase.Running:
+                self.game.logger.error(
+                    f"Task for event '{event}' was cancelled while the game was"
+                    f" still running"
+                )
         except Exception as e:
-            logger = get_logger(__name__)
-            logger.error(f"Error while interpreting event '{event}': {e}")
+            self.game.logger.error(
+                f"Error while interpreting event '{event}': {e}"
+            )
             traceback.print_exc()
-            #logger.error(f"data: '{data}'")
-            pass
         
 
 
     # Listening Jobs
-    async def listen_to_messages(self):
-        async for msg in self.msg_channel:
-            if msg is None: break
-            get_logger(__name__).log(5, f"Received message: {msg}")
-            await self.interpret(msg)
-
-
-    async def start_listening_job(self, game = None):
+    async def listen_to_messages(self, established_event: asyncio.Event, game = None):
         self.set_game(game)
-        if self.listening_job is None:
-            loop = asyncio.get_event_loop()
-            self.listening_job = loop.create_task(self.listen_to_messages())
+        established_event.set()
+        self.game.logger.log(5, "Listening for incoming messages")
+        async for msg in self.input_channel:
+            if msg is None: break
+            self.game.logger.log(5, f"Received message: {msg}")
+            self.interpret(msg)
 

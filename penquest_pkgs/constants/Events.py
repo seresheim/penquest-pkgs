@@ -14,11 +14,13 @@ class Events:
     SELECTION_OFFER_CHANGED     = 'selection_offer_changed'         # Received changes to the selection offer (like drawing cards)
     HAND_CHANGED                = 'hand_changed'                    # Received changes to the cards in the hand
     SHOP_CHANGED                = 'shop_changed'                    # Received changes to the shop
+    SHOP_UPDATED                = 'shop_updated'                    # Received changes to the shop  (like new equipment)
     EQUIPMENT_CHANGED           = 'equipment_changed'               # Received changes to the equipment of the player
     PLAYERS_CHANGED             = 'players_changed'                 # Received changes to the players in the game
     PLAYER_ROLE_CHANGED         = 'player_role_changed'             # Received changes to the player role this event informs the client of the roles of all players
     PLAYER_ATTRIBUTE_CHANGED    = 'player_attribute_changed'        # Received changes to the player attributes
     GAME_OPTIONS_CHANGED        = 'game_options_changed'            # Received changes to the game options made by the host
+    REMOVED_EQUIPMENT_FROM_SHOP = 'remove_equipment_from_shop'     # Received when equipment is removed from the shop
 
     # Info events
     GAME_STARTED                = 'game_started'                    # Received when the game has started
@@ -29,6 +31,7 @@ class Events:
     GET_SELECT_ACTION           = 'get_select_action'               # Send when the player needs to select an action to play
     ALL_ACTIONS_PLAYABLE        = 'all_actions_playable'            # Send when the gameserver replyed to the GET_VALID_ACTIONS command
     SEND                        = 'send'                            # Indicates that a message should be send to the gameserver
+    ACTIONS_RECEIVED            = 'actions_received'                # Received when the gameserver replyed to the GET_VALID_ACTIONS command
 
     # Command reply events
     PLAY_ACTION_REPLY           = 'play_action_reply'               # Received when the gameserver replyed to the PLAY_ACTION command

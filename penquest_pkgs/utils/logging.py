@@ -3,15 +3,16 @@ import logging
 import sys
 from logging.handlers import RotatingFileHandler
 
-loggers = {}
 main_log_handler = None
 console_log_handler = None
-log_format = '[%(asctime)s] - [%(name)s] - [%(levelname)s] - %(message)s'
+log_format = '[%(asctime)s][%(class_name)-46s][%(game)s][%(connection_id)s][%(role)s][%(taskName)s][%(levelname)s]-%(message)s'
 log_dir = 'logs'
 log_file_name = 'env.log'
 
-ENV_PQ_DEBUG_LEVEL = "PQ_DEBUG_LEVEL"
+LOG_LEVEL_NETWORK_MINOR = 4
+LOG_LEVEL_NETWORK = 5
 
+ENV_PQ_DEBUG_LEVEL = "PQ_DEBUG_LEVEL"
 
 
 def attach_bot_log_handler(logger):
@@ -60,15 +61,29 @@ def attach_bot_log_handler(logger):
         logger.addHandler(console_log_handler)
 
 
-def get_logger(logger_name='default'):
-    loggername = 'penquest.{}'.format(logger_name)
+def get_logger(
+        class_name: str='default', 
+        connection_id: str=None, 
+        game: str='None',
+        role: str='None',
+    ) -> logging.Logger:
 
-    if loggers.get(loggername):
-        return loggers.get(loggername)
+    extra = {
+        'class_name': class_name,
+        'game': game,
+        'connection_id': connection_id if connection_id is not None else 'None',
+        'role': role,
+    }
 
-    logger = logging.getLogger(loggername)
+    # create a specific default logger with a name, otherwise the root logger
+    # is returned, which is also used by other packages like aiormq
+    if connection_id is None:
+        logger_name = "my_logger_name"
+    else:
+        logger_name = connection_id
+    logger = logging.getLogger(logger_name)
     attach_bot_log_handler(logger)
     logger.setLevel(1)
+    logger = logging.LoggerAdapter(logger, extra)
 
-    loggers[loggername] = logger
     return logger

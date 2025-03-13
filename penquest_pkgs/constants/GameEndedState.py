@@ -1,6 +1,4 @@
-from enum import Enum
-
-class GameEndedState(Enum):
+class GameEndedState():
     WON = 1
     LOST = 2
     DRAW = 3

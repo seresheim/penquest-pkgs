@@ -1,5 +1,5 @@
 from .config import retrieve_value_from_config
-from .logging import get_logger
+from .logging import get_logger, LOG_LEVEL_NETWORK, LOG_LEVEL_NETWORK_MINOR
 from .ios import parse_stream, parse_queue, write_stream, write_queue
 from .Handler import EventBasedObject
 from .EnumEncoder import EnumEncoder
@@ -12,5 +12,7 @@ __all__ = [
     write_stream,
     write_queue,
     EventBasedObject,
-    EnumEncoder
+    EnumEncoder,
+    LOG_LEVEL_NETWORK,
+    LOG_LEVEL_NETWORK_MINOR
 ]

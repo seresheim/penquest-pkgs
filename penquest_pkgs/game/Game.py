@@ -1,45 +1,57 @@
 import asyncio
-import itertools
 import dataclasses
-
+import functools
+import random
+import time
 from typing import Optional, Dict, List, Any, Tuple, Union
 
+import pandas as pd
 from penquest_pkgs.network.game_messages import outbound as OutboundMessages
 from penquest_pkgs.network.game_messages.outbound import dataclass_to_dict
 from penquest_pkgs.utils.Handler import EventBasedObject
 from penquest_pkgs.model import (
-    GameState,
-    ExternalGamePhase,
-    InternalGamePhase,
-    GameOptions,
-    Lobby,
-    Player, 
-    Asset,
-    Game,
-    Actor
+    GameStateModel,
+    GameOptionsModel,
+    LobbyModel,
+    PlayerModel,
+    AssetModel,
+    GameModel,
+    ActorModel,
+    ScenarioTeaserModel,
+    EquipmentModel,
+    ActionModel,
+    AssetChangesModel,
+    PostGameSummaryModel,
 )
-
-import penquest_pkgs.network.game_messages.message_models as Messages 
-
-from penquest_pkgs.constants.Events import Events
-from penquest_pkgs.constants.Commands import Commands
-from penquest_pkgs.constants.MessageType import MessageType
-from penquest_pkgs.constants.GameStoragePhase import GameStoragePhase
-from penquest_pkgs.constants.GameInteractions import GameInteractionType
+from penquest_pkgs.exceptions import Errors, PenQuestException
+from penquest_pkgs.constants import (
+    VALID_ATTACK_MASKS,
+    Events,
+    Commands,
+    MessageType,
+    GameStoragePhase,
+    GameInteractionType,
+    EquipmentShopMode,
+    GamePhase,
+    GameInteractionPhase,
+    ActorType,
+)
+import penquest_pkgs.network.game_messages.message_models as Messages
 from penquest_pkgs.utils.logging import get_logger
-from penquest_pkgs.game.mappers import map_message2model, map_model2message
+from penquest_pkgs.game.game_interactions import GameInteraction
+from penquest_pkgs.game.GameInputInterpreter import GameInputInterpreter
+from penquest_pkgs.game.GameOutputInterpreter import GameOutputInterpreter 
+from penquest_pkgs.game.game_helper import GameHelper
+from penquest_pkgs.game.actor_helper import ActorHelper
 
-        
 GAME_PHASE_MAP = {
     "Starting": 0,
-    "InitDraw": 1,
-    "Shopping": 2,
+    "DefenderPreSetup": 1,
+    "InitDraw": 2,
     "Attack": 3,
     "Defense": 4,
     "Ended": 5
 }
-
-VALID_ATTACK_MASKS = ["C", "I", "A", "CI", "CA", "IA", "CIA"]
 
 
 class Game(EventBasedObject):
@@ -64,13 +76,13 @@ class Game(EventBasedObject):
     Attributes:
         phase(GameStoragePhase): Indicates in which 'general' phase the game
             currently is. These can be Start, Lobby, Running and Ended and
-            should not be confused with ExternalGamePhase, which indicate the current
-            phase within a running game. Thus the ExternalGamePhases usually change
+            should not be confused with GamePhase, which indicate the current
+            phase within a running game. Thus the GamePhases usually change
             while the GameStoragePhase has the value 'Running'.
         lobby(): the game lobby, required to create a new game
         actor_id(): ID of the role within a running game (e.g. ID of the role
             'Attacker1')
-        actor_connection_id(): 
+        connection_id(): 
         game_state(GameState): state of the current game. This field is set, as
             soon as a new game was created
         action_detected_history(List): 
@@ -80,42 +92,124 @@ class Game(EventBasedObject):
             methods to send messages to the PenQuest server.
         offer_received_this_turn(bool): indicates whether the role has already
             received an offer of actions which to choose the next actions from
+        shop_updated(bool): indicates whether the shop has been updated this 
+            turn already.        
         interaction_buffer(asyncio.Queue): stores the next interactions the 
             game requires from the environment
 
     """
 
-    def __init__(self):
+    def __init__(self, code: str = None, slot: int = None):
         """Initializes all attributes"""
         super(Game, self).__init__()
 
+        self.code = code
+        self.slot = slot
         self.phase = GameStoragePhase.Start
-        self.lobby: Lobby = None
-        self.actor_connection_id: str = None
+        self.lobby: LobbyModel = None
+        self._connection_id: str = None
 
-        self.game_state: GameState = None
+        self.game_state: GameStateModel = None
         self.action_detected_history: List = []
 
         self.input = Game.Input(self)
         self.output = Game.Output(self)
         self.offer_received = False
+        self.shop_updated = False
 
-        # Create interaction queue this indicates that player interaction is 
+        self._all_action_combinations: List[Tuple[int, int, int]] = None
+
+        self.play_action_finished = asyncio.Event()
+
+        # Create interaction queue this indicates that player interaction is
         # needed and which kind/type of interaction it is
         self.interaction_buffer = asyncio.Queue()
+        
+        self.rng = random.Random()
+        self.leave_game_sent = False
+
+        self.input_queue: asyncio.Queue = None
+        self.input_task: asyncio.Task = None
+        self.input_interpreter: GameInputInterpreter = None
+
+        self.output_queue: asyncio.Queue = None
+        self.output_task: asyncio.Task = None
+        self.output_interpreter: GameOutputInterpreter = None
+
+        self.logger = get_logger(__name__)
+
+    @property  
+    def connection_id(self) -> str:
+        return self._connection_id
+    
+    @connection_id.setter
+    def connection_id(self, connection_id: str):
+        self._connection_id = connection_id
+        if self.game_state is not None:
+            role = self.game_state.role.type
+        else:
+            role = 'None'
+        self.logger = get_logger(__name__, connection_id, self.code, role)
+
+    async def start_listening(
+            self, 
+            input_channel: Union[asyncio.StreamWriter, asyncio.Queue], 
+            output_channel: Union[asyncio.StreamWriter, asyncio.Queue]
+        ):
+        """Starts the listening tasks for incoming and outgoing messages and
+        puts the first interaction into the interaction buffer
+        """
+        self.input_channel = input_channel
+        self.output_channel = output_channel
+
+        # Start listening output
+        self.output_interpreter = GameOutputInterpreter(output_channel)
+        self.output_task = asyncio.create_task(
+            self.output_interpreter.start_listening(self)
+        )
+        current_name = self.output_task.get_name().split("-")
+        self.output_task.set_name(
+            f"Task-{current_name[-1]}(game_output)"
+        )
+
+        # Start listening input
+        established_event = asyncio.Event()
+        self.input_interpreter = GameInputInterpreter(input_channel)
+        self.input_task = asyncio.create_task(
+            self.input_interpreter.listen_to_messages(established_event, self)
+        )
+        current_name = self.input_task.get_name().split("-")
+        self.input_task.set_name(
+            f"Task-{current_name[-1]}(game_input)"
+        )
+
+        await established_event.wait()
+
+        # Put first interaciton into buffer
         self.interaction_buffer.put_nowait(
             GameInteractionType.CREATE_OR_JOIN_LOBBY
         )
+
         
     async def close(self):
-        """Sends an END message to the message listenting task and puts an END
+        """Cancels the listening tasks for input and output and puts an END
         interaction type into the interaction buffer
         """
-        get_logger(__name__).info(
-            f"closing game with connection_id '{self.actor_connection_id}'"
+        self.logger.info(
+            f"closing game with connection_id '{self.connection_id}'"
         )
-        await self.dispatch_event(Events.SEND, [MessageType.COMMAND, None])
         self.interaction_buffer.put_nowait(GameInteractionType.END)
+        
+        try:
+            self.input_task.cancel()
+            self.output_task.cancel()
+        except asyncio.CancelledError:
+            # Silently exit tasks
+            pass
+        
+        # destroy references for garbage collection
+        self.input_interpreter.game = None
+        self.output_interpreter.game = None
 
     # Event handling
     async def dispatch_command(
@@ -137,13 +231,14 @@ class Game(EventBasedObject):
         """
         return await self.dispatch_event(
             Events.SEND, 
-            [ 
+            ( 
+                self.connection_id,
                 msg_type, 
                 {
                     'event': command,
                     'data': dataclass_to_dict(message) if message is not None else {}
                 }
-            ]
+            )
         )
 
 
@@ -165,9 +260,10 @@ class Game(EventBasedObject):
             :param outer_class_object: references to the game object
             """
             self.game = outer_class_object
+            self.connection_id = None
 
         async def _await_correct_game_storage_phase(
-                self, 
+                self,
                 game_storage_phase: Union[GameStoragePhase, List[GameStoragePhase]]
             ):
             """Awaits until the current GameStoragePhase is one of the desired
@@ -189,13 +285,13 @@ class Game(EventBasedObject):
                     await self.game.await_event(
                         Events.GAME_STORAGE_PHASE_CHANGED
                     )
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as e:
                 raise asyncio.TimeoutError(
                     f"Wrong game storage phase! Current phase is "
                     f"{self.game.phase} but exepcetd one of "
-                    f"{', '.join([x.value for x in correct_phases])}"
-                )
-            
+                    f"{', '.join([str(x) for x in correct_phases])}"
+                ) from e
+          
         def _hide_asset(self, asset_id: int):
             """Hides an asset that is currently visible on the board
 
@@ -217,8 +313,12 @@ class Game(EventBasedObject):
             if len(list_index) > 1: 
                 raise RuntimeError(f"Found more than one asset with the id {asset_id}")
             self.game.game_state.assets_on_board.pop(list_index[0])
+            self.game.logger.debug(
+                f"Removed asset with id {asset_id} from assets_on_board"
+            )
+            self._remove_assets_from_playable_combs([asset_id])
 
-        def _reveal_asset(self, asset: Asset):
+        def _reveal_asset(self, asset: AssetModel):
             """Reveals an asset on the game board
 
             :param asset: Assets to include on the game board
@@ -228,10 +328,14 @@ class Game(EventBasedObject):
                 raise RuntimeError("Cannot start game if game state is not set")
 
             # Add to board if not already on board
-            if asset in self.game.game_state.assets_on_board: return
+            if asset in self.game.game_state.assets_on_board: 
+                return
             self.game.game_state.assets_on_board.append(asset)
+            self.game.logger.debug(
+                f"Added asset {asset.name}({asset.id}) to assets_on_board"
+            )
 
-        async def update_player(self, player: Messages.Player):
+        async def update_player(self, player: PlayerModel):
             """Updates the information stored about the player object that
             represents the agent in the game.
 
@@ -239,13 +343,13 @@ class Game(EventBasedObject):
             :event players_changed: notifies all waiting tasks that a
                 'players_changed' event occured
             """
-            self.game.actor_connection_id = player.connection_id
+            self.connection_id = player.connection_id
 
             if self.game.lobby is not None:
                 changed = False
-                for slot, p in self.game.lobby.items():
+                for slot, p in self.game.lobby.players.items():
                     if player.id == p.id and player.connection_id == p.connection_id:
-                        self.game.lobby[slot] = map_message2model(player)
+                        self.game.lobby.players[slot] = player
                         changed = True
                         break
                 if changed:
@@ -253,8 +357,14 @@ class Game(EventBasedObject):
                         Events.PLAYERS_CHANGED,
                         { 'players': self.game.lobby.players }
                     )
+            
+            if self.game.game_state is not None:
+                self.game.game_state = dataclasses.replace(
+                    self.game.game_state, 
+                    connection_id=self.connection_id
+                )
 
-        async def set_lobby_information(self, lobby: Messages.Lobby):
+        async def set_lobby_information(self, lobby: LobbyModel):
             """Sets the lobby information of the game
 
             :param lobby: Dict of lobby info
@@ -275,9 +385,12 @@ class Game(EventBasedObject):
             if self.game.lobby is not None and self.game.lobby.scenario != lobby.scenario:
                 scenario_changed = True
 
-            self.game.lobby = map_message2model(lobby)
+            self.game.lobby = lobby
             if self.game.phase != GameStoragePhase.Lobby:
                 self.game.phase = GameStoragePhase.Lobby
+            self.game.rng.seed(lobby.seed)
+            self.game.logger.debug(f"Set seed: {lobby.seed}")
+
             await self.game.dispatch_event(
                 Events.LOBBY_CHANGED,
                 {'lobby': self.game.lobby}
@@ -295,7 +408,7 @@ class Game(EventBasedObject):
 
         async def set_lobby_player_information_for_slot(
                 self,
-                player: Messages.Player,
+                player: PlayerModel,
                 slot: int
             ):
             """Adds a player to a game lobby
@@ -319,13 +432,13 @@ class Game(EventBasedObject):
                     "Cannot add player when game is not in lobby phase"
                 )
 
-            self.game.lobby.players[slot] = map_message2model(player)
+            self.game.lobby.players[slot] = player
             await self.game.dispatch_event(
                 Events.PLAYERS_CHANGED,
                 { 'players': self.game.lobby.players }
             )
 
-        async def remove_player(self, player: Messages.Player, slot: int):
+        async def remove_player(self, player: PlayerModel, slot: int):
             """Removes a player from the game lobby
 
             :param player: Player to remove from the game
@@ -342,7 +455,7 @@ class Game(EventBasedObject):
             
             del self.game.lobby.players[slot]
 
-        async def set_scenario(self, scenario: Messages.ScenarioTeaser):
+        async def set_scenario(self, scenario: ScenarioTeaserModel):
             """Sets the scenario of the game
 
             :param scenario: the scenario object to set
@@ -353,7 +466,7 @@ class Game(EventBasedObject):
             if self.game.phase != GameStoragePhase.Lobby:
                 raise RuntimeError("Cannot set scenario when not in lobby")
 
-            self.game.lobby.scenario = map_message2model(scenario)
+            self.game.lobby.scenario = scenario
             await self.game.dispatch_event(
                 Events.SCENARIO_CHANGED,
                 { 'scenario': scenario }
@@ -391,13 +504,15 @@ class Game(EventBasedObject):
             :param code: error code of the crash
             :param reason: error message of the crash
             """
-            get_logger().error(f"The game crashed! Reason: f{code} - {reason}")
+            self.game.logger.error(
+                f"The game crashed! Reason: f{code} - {reason}"
+            )
             await self.game.leave_game()
             await self.game.close()
 
         async def update_game_options(
                 self,
-                new_game_options: Messages.GameOptions
+                new_game_options: GameOptionsModel
             ):
             """Updates local game options with the given game options
 
@@ -413,26 +528,26 @@ class Game(EventBasedObject):
                     "Cannot change game options when game is not in lobby phase"
                 )
 
-            self.game.lobby.game_options = map_message2model(new_game_options)
+            self.game.lobby.game_options = new_game_options
             await self.game.dispatch_event(
                 Events.GAME_OPTIONS_CHANGED,
                 { 'game_options': new_game_options }
             )
 
-        async def lobby_left(self, player: Messages.Player):
+        async def lobby_left(self, player: PlayerModel):
             """Closes the game if the player that left the game was the agent
             itself.
 
             :param player: player that left the game (lobby)
             """
-            get_logger().info(
+            self.game.logger.info(
                     f"Player {player.name}({player.id}) left the current "
                     "lobby/game"
                 )
-            if player.connection_id == self.game.actor_connection_id:
+            if player.connection_id == self.game.connection_id:
                 await self.game.close()
-                
-        async def start_game(self, game: Optional[Messages.Game] = None):
+
+        async def start_game(self, game: Optional[GameModel] = None):
             """Creates the initial GameState and sets the current 
             GameStoragePhase to 'running'
 
@@ -458,23 +573,23 @@ class Game(EventBasedObject):
                 raise RuntimeError(
                     "Scenario of lobby is not the same as scenario of game"
                 )
-            if self.game.actor_connection_id is None:
+            if self.game.connection_id is None:
                 raise RuntimeError(
                     "Cannot start game when player id or connection id is not "
                     "set"
                 )
-            if self.game.actor_connection_id not in game.roles:
+            if self.game.connection_id not in game.roles:
                 raise RuntimeError("Didn't find role of this player in game")
 
-            self.game.game_state = GameState(
+            self.game.game_state = GameStateModel(
                 name = self.game.lobby.code,
                 scenario = self.game.lobby.scenario,
                 game_options = self.game.lobby.game_options,
                 from_lobby = self.game.lobby,
-                actor_connection_id = self.game.actor_connection_id,
+                connection_id = self.game.connection_id,
                 #actor_id = self.game.actor_id,
-                shop = map_message2model(game.shop),
-                selection_amount = game.amount_selection
+                shop = game.shop,
+                selection_amount = game.amount_selection if game.amount_selection > 0 else -1,
             )
 
             self.game.phase = GameStoragePhase.Running
@@ -484,12 +599,18 @@ class Game(EventBasedObject):
             )
 
             await self.set_players_and_roles(game.players, game.roles)
+            self.game.logger = get_logger(
+                __name__, 
+                self.game.connection_id, 
+                self.game.code, 
+                self.game.game_state.role.type
+            )
             await self.game.dispatch_event(Events.GAME_STARTED)
 
         async def set_players_and_roles(
-                self, 
-                players: List[Messages.Player], 
-                roles: Dict[str, Messages.Actor]
+                self,
+                players: List[PlayerModel], 
+                roles: Dict[str, ActorModel]
             ):
             """Sets the players and their roles; updates the assets in the game
             state; updates actions/equipment on the agents hand
@@ -516,21 +637,22 @@ class Game(EventBasedObject):
                 )
             if self.game.game_state is None:
                 raise RuntimeError("Cannot start game if game state is not set")
-            if self.game.game_state.actor_connection_id is None:
+            if self.game.game_state.connection_id is None:
                 raise RuntimeError(
                     "Cannot start game when player id or connection id is not "
                     "set"
                 )
-            if self.game.game_state.actor_connection_id not in roles.keys():
+            if self.game.game_state.connection_id not in roles.keys():
                 raise RuntimeError("Didn't find role of this player in game")
             
-            role = roles.get(self.game.game_state.actor_connection_id, None)
-            if role is None: raise RuntimeError("Player role is not set")
+            role = roles.get(self.game.game_state.connection_id, None)
+            if role is None: 
+                raise RuntimeError("Player role is not set")
 
             # Set player roles
             self.game.game_state = dataclasses.replace(
                 self.game.game_state, 
-                roles=map_message2model(roles)
+                roles=roles
             )
 
             # Update game state with asset list from role
@@ -539,7 +661,7 @@ class Game(EventBasedObject):
                 if asset in self.game.game_state.assets_on_board: continue
                 self.game.game_state.assets_on_board.append(asset)
             # Update game state with asset list from role if role is defender
-            if role.type == "defender":
+            if role.type == ActorType.DEFENCE:
                 for asset in role.assets:
                     if asset in self.game.game_state.assets_on_board: continue
                     self.game.game_state.assets_on_board.append(asset)
@@ -594,6 +716,9 @@ class Game(EventBasedObject):
             # Get role and check if attribute is in role
             role = self.game.get_player_role()
             if role is None: raise RuntimeError("Player role is not set")
+            # TODO: fix this workaround
+            if attribute == "insightShield":
+                attribute = "insight_shield"
             if not hasattr(role, attribute):
                 raise ValueError(
                     f"Attribute '{attribute}' is not in player attributes"
@@ -601,6 +726,9 @@ class Game(EventBasedObject):
             
             # Set attribute and dispatch event
             setattr(role, attribute, value)
+            self.game.logger.debug(
+                f"player {role.name}({role.type}): changed {attribute} to {value}"
+            )
             await self.game.dispatch_event(
                 Events.PLAYER_ATTRIBUTE_CHANGED,
                 { 'attribute': attribute, 'value': value }
@@ -622,51 +750,81 @@ class Game(EventBasedObject):
             if self.game.game_state is None:
                 raise RuntimeError("Cannot start game if game state is not set")
 
-            # Convert game phase to ExternalGamePhase object if it is not already one
+            # Convert game phase to GamePhase object if it is not already one
             if type(game_phase) == str:
                 if game_phase not in GAME_PHASE_MAP:
                     raise ValueError(f"Unknown game phase: {game_phase}")
                 game_phase = GAME_PHASE_MAP[game_phase]
-            if type(game_phase) == int:
-                game_phase = ExternalGamePhase(game_phase)
-            
-            is_my_turn = self.game._is_my_turn(game_phase)
-            if is_my_turn:
-                internal_phase = InternalGamePhase.Shopping
-            else:
-                internal_phase = InternalGamePhase.Idle
 
-            # Set game phase and dispatch event
+            # Set game phase
             self.game.game_state = dataclasses.replace(
                 self.game.game_state, 
-                external_phase=game_phase,
-                internal_phase=internal_phase
+                game_phase=game_phase,
             )
+            self.game.logger.debug(f"Game phase changed to {game_phase}")
+
+            # get correct interaction phase
+            is_my_turn = self.game._is_my_turn(game_phase)
+            if is_my_turn:
+                if self.game.game_state.turn > 1 or self.game.game_state.game_phase in [GamePhase.DefenderPreSetup, GamePhase.InitDraw]:
+                    if not self.game.offer_received:
+                        # wait until the selection offer has been received
+                        await self.game.await_event(
+                            Events.SELECTION_OFFER_CHANGED
+                        )
+                self.game.game_state = GameInteraction.move_from_idle(
+                    self.game.game_state
+                )
+            else:
+                self.game.game_state = GameInteraction.move_from_playing(
+                    self.game.game_state
+                )
+
+            # dispatch event to whoever needs it
+            if game_phase == GamePhase.Ended:
+                self.game.phase = GameStoragePhase.Ended
             await self.game.dispatch_event(
                 Events.GAME_PHASE_CHANGED,
                 { 'game_phase': game_phase }
             )
 
             # Decide on next interaction type
-            interaction_type = None
-            if game_phase == ExternalGamePhase.InitDraw:
-                interaction_type = GameInteractionType.CHOOSE_ACTION
-            elif is_my_turn:
-                if self.game.game_state.turn == 1:
-                    if internal_phase == InternalGamePhase.Shopping and self.game.lobby.game_options.equipment_shop_mode > 0:
-                        interaction_type = GameInteractionType.SHOPPING_PHASE
-                    else:
-                        interaction_type = GameInteractionType.PLAY_CARD
-                else:
-                    # each turn starts with redrawing an action, only the first
-                    # turn starts immediately with playing an action card
-                    interaction_type = GameInteractionType.CHOOSE_ACTION
-
-            # Put interaction type in buffer
-            if interaction_type is not None:
+            interaction_type = GameInteraction.get_interaction(
+                self.game.game_state
+            )
+            if interaction_type  == GameInteractionType.PLAY_CARD:
+                await self.game._switch_to_play_card_git()
+            elif interaction_type == GameInteractionType.CHOOSE_ACTION:
+                await self.game._switch_to_redraw_git()
+            elif interaction_type is not None:
                 self.game.interaction_buffer.put_nowait(interaction_type)
+            elif interaction_type is None:
+                self.game.logger.debug(
+                    f"Idle waiting for game to proceed into a different phase."
+                )
+            else:
+                raise ValueError(f"Unknown interaction type {interaction_type}")
 
-        async def set_assortment(self, equipment: List[Messages.Equipment]):
+        async def actor_detected(self, actorId: int):
+            """Sets the game state discovered to True if the actor id matches
+
+            :param actor_id: ID of the agent
+            :raise RuntimeError: game state is None
+            :event actor_detected: notifies all waiting tasks that a
+                'actor_detected' event occured
+            """
+            await self._await_correct_game_storage_phase(
+                GameStoragePhase.Running
+            )
+            if self.game.game_state is None:
+                raise RuntimeError("Cannot set actor if game state is not set")
+
+            self.game.game_state = dataclasses.replace(
+                self.game.game_state, 
+                discovered=True,
+            )
+
+        async def set_assortment(self, equipment: List[EquipmentModel]):
             """Sets the assortment of the agent which it can shop from during
             the shopping phase
 
@@ -687,14 +845,19 @@ class Game(EventBasedObject):
 
             self.game.game_state = dataclasses.replace(
                 self.game.game_state, 
-                shop=map_message2model(equipment)
+                shop=equipment
+            )
+            self.game.shop_updated = True
+            await self.game.dispatch_event(
+                Events.SHOP_UPDATED,
+                { 'shop': equipment }
             )
             await self.game.dispatch_event(
                 Events.SHOP_CHANGED,
                 { 'shop': equipment }
             )
 
-        async def add_equipment(self, equipment: List[Messages.Equipment]):
+        async def add_equipment(self, equipment: List[EquipmentModel]):
             """Adds equipment to the agent's equipment and removes it from the
             shop
 
@@ -713,16 +876,12 @@ class Game(EventBasedObject):
                     "Cannot set equipment if game state is not set"
                 )
             
-            equipment = map_message2model(equipment)
+            equipment = equipment
             equipment_ids = []
             # Update equipment hand
             for eq in equipment:
                 equipment_ids.append(eq.id)
                 self.game.game_state.equipment.append(eq)
-            await self.game.dispatch_event(
-                Events.EQUIPMENT_CHANGED,
-                {'equipment': equipment }
-            )
 
             # Update shop for missing equipment that was purchased
             shop_list_indexes = [
@@ -737,10 +896,34 @@ class Game(EventBasedObject):
                 Events.SHOP_CHANGED, 
                 { 'shop': self.game.game_state.shop }
             )
+            await self.game.dispatch_event(
+                Events.EQUIPMENT_CHANGED,
+                {'equipment': equipment }
+            )
+
+        async def remove_equipment_from_shop(self, equipmentIds: List[str]):
+            """Removes equipment from the shop
+
+            :param eq_ids: List of equipment IDs to remove
+            """
+            if self.game.game_state is None:
+                raise RuntimeError("Cannot remove equipment if game state is not set")
+            if self.game.game_state.shop is None:
+                raise RuntimeError("Cannot remove equipment if shop is not set")
+
+            for eq_id in equipmentIds:
+                for eq in self.game.game_state.shop:
+                    if eq.id == eq_id:
+                        self.game.game_state.shop.remove(eq)
+                        break
+            await self.game.dispatch_event(
+                Events.REMOVED_EQUIPMENT_FROM_SHOP,
+                { 'equipment_ids': equipmentIds }
+            )
 
         async def add_new_actions_to_hand(
-                self, 
-                new_actions: List[Messages.Action]
+                self,
+                actions: List[ActionModel]
             ):
             """Adds new actions to the hand of the player (like after drawing 
             cards)
@@ -762,53 +945,27 @@ class Game(EventBasedObject):
                     "Cannot add new actions to hand if game state is not set"
                 )
             
-            new_actions = map_message2model(new_actions)
             # Add new actions to hand
-            self.game.game_state.hand.extend(new_actions)
+            self.game.game_state.hand.extend(actions)
+
+            action_str = ", ".join(
+                [str(action.template_id) for action in actions]
+            )
+            self.game.logger.debug(f"Added actions {action_str} to hand")
+
             await self.game.dispatch_event(
                 Events.HAND_CHANGED,
                 { 'hand': self.game.game_state.hand }
             )
-            if self.game._is_my_turn(self.game.game_state.external_phase):
-                if self.game.lobby.game_options.equipment_shop_mode > 0:
-                    self.game.interaction_buffer.put_nowait(
-                        GameInteractionType.SHOPPING_PHASE
-                    )
-                else:
-                    self.game.interaction_buffer.put_nowait(
-                        GameInteractionType.PLAY_CARD
-                    )
-
-        async def set_all_actions_playable(
-                self, 
-                playable_results: List[Messages.Playable]
-            ):
-            """Sets the playable actions
-
-            :param playable_results: List of playable actions
-            :raise RuntimeError: game state is None
-            :event all_actions_playable: notifies all waiting tasks that a
-                'all_actions_playable' event occured
-            """
-            await self._await_correct_game_storage_phase(
-                GameStoragePhase.Running
-            )
-            if self.game.game_state is None:
-                raise RuntimeError(
-                    "Cannot set playable actions if game state is not set"
-                )
-            
-            # TODO: process incoming information
-
             await self.game.dispatch_event(
-                Events.ALL_ACTIONS_PLAYABLE,
-                { 'actions': playable_results }
+                Events.ACTIONS_RECEIVED,
+                { 'actions': actions }
             )
 
         async def played_action_reply(
                 self, 
                 successful: bool, 
-                action: Messages.Action
+                action: ActionModel
             ):
             """Feedback from the gameserver if the played action was successful
 
@@ -836,7 +993,7 @@ class Game(EventBasedObject):
 
         async def add_actions_detected_event(
                 self, 
-                actions: List[Messages.Action]
+                actions: List[ActionModel]
             ):
             """Adds an actions detected event
 
@@ -845,10 +1002,9 @@ class Game(EventBasedObject):
             await self._await_correct_game_storage_phase(
                 GameStoragePhase.Running
             )
-            actions = map_message2model(actions)
             self.game.action_detected_history.append(actions)
 
-        async def update_assets(self, asset_changes: Messages.AssetChanges):
+        async def update_assets(self, asset_changes: AssetChangesModel):
             """Updates the assets on the board with new incoming information, in
             terms of newly revealed or hidden assets
 
@@ -859,7 +1015,7 @@ class Game(EventBasedObject):
             )
 
             for asset in asset_changes.revealed:
-                self._reveal_asset(map_message2model(asset))
+                self._reveal_asset(asset)
             for asset_id in asset_changes.hidden:
                 self._hide_asset(asset_id)
 
@@ -874,19 +1030,118 @@ class Game(EventBasedObject):
             :param equipmentIds: List of equipment IDs that should be removed
             """
             actions_to_be_removed = [
-                action 
+                action
                 for action in self.game.game_state.hand 
                 if action.id in actionIds
             ]
             equipment_to_be_removed = [
-                equipment 
-                for equipment in self.game.game_state.equipment 
+                equipment
+                for equipment in self.game.game_state.equipment
                 if equipment.id in equipmentIds
             ]
+            action_idxs = [
+                self.game.game_state.hand.index(a) 
+                for a in actions_to_be_removed
+            ]
+            eq_idxs = [
+                self.game.game_state.equipment.index(e)+1 
+                for e in equipment_to_be_removed
+            ]
+
+            # also remove validated_actions in case multiple actions are played
+            # in one turn
+            self._remove_actions_from_validated_actions(actions_to_be_removed)
+
+            # remove playable actions in case multiple actions are played in one
+            # turn
+            if len(actions_to_be_removed) > 0:
+                self._remove_actions_from_playable_combs(action_idxs)
+            if len(equipment_to_be_removed) > 0:
+                self._remove_equipment_from_playable_combs(eq_idxs)
+
             for action in actions_to_be_removed:
                 self.game.game_state.hand.remove(action)
             for equipment in equipment_to_be_removed:
                 self.game.game_state.equipment.remove(equipment)
+
+        def _remove_actions_from_validated_actions(self, actions: List[ActionModel]):
+            if self.game.game_state.validated_actions is None:
+                return
+            # first find validated actions object that is to be removed
+            validated_actions = []
+            for action in actions:
+                for validated_action in self.game.game_state.validated_actions:
+                    if validated_action.action == action:
+                        validated_actions.append(validated_action)
+                        break
+            for validated_action in validated_actions:
+                self.game.game_state.validated_actions.remove(validated_action)
+
+        def _remove_actions_from_playable_combs(self, action_idxs: List[int]):
+            """Removes actions from the playable actions combinations based
+            on a list of action indices from the hand
+
+            :param action_idxs: List of action indices in the order of the hand
+            """
+            # reduce the indices of all playable actions that come after the
+            # actions that are removed by one.
+            df = self.game.game_state.playable_actions
+            if df is None or df.empty or df.size == 0:
+                return
+            
+            for action_idx in action_idxs:
+                # remove playable actions if action was main action
+                df = df[df[0] != action_idx]
+                df.loc[:, 0] = df[0].apply(lambda x: x - 1 if x > action_idx else x)
+
+                # remove playable actions if action was support action
+                df = df[df[3] != action_idx]
+                df.loc[:, 3] = df[3].apply(lambda x: x - 1 if x > action_idx else x)
+
+            self.game.game_state = dataclasses.replace(
+                self.game.game_state, 
+                playable_actions=df
+            )
+
+        def _remove_assets_from_playable_combs(self, asset_ids: List[int]):
+            """Removes assets from the playable actions combinations based
+            on a list of asset IDs
+
+            :param asset_ids: List of asset IDs
+            """
+            df = self.game.game_state.playable_actions
+            if df is None or df.empty or df.size == 0:
+                return
+            
+            for asset_id in asset_ids:
+                # remove playable actions if action was main action
+                df = df[df[1] != asset_id]
+                df.loc[:, 1] = df[1].apply(lambda x: x - 1 if x > asset_id else x)
+
+            self.game.game_state = dataclasses.replace(
+                self.game.game_state, 
+                playable_actions=df
+            )
+        
+        def _remove_equipment_from_playable_combs(self, eq_idxs: List[int]):
+            """Removes assets from the playable actions combinations based
+            on a list of asset IDs
+
+            :param eq_idxs: List of equipment indices in the order of the hand
+            """
+            df = self.game.game_state.playable_actions
+            if df is None or df.empty or df.size == 0:
+                return
+            
+            for eq_idx in eq_idxs:
+                # remove playable actions if action was main action
+                df = df[df[4] != eq_idx]
+                df.loc[:, 0] = df[4].apply(lambda x: x - 1 if x > eq_idx else x)
+
+            self.game.game_state = dataclasses.replace(
+                self.game.game_state, 
+                playable_actions=df
+            )
 
         async def game_turn_changed(self, currentTurn: int):
             """Sets game state to the new turn and initializes turn variables
@@ -897,10 +1152,13 @@ class Game(EventBasedObject):
                 GameStoragePhase.Running
             )
 
-            self.game.game_state = dataclasses.replace(self.game.game_state, turn=currentTurn)
+            self.game.game_state = dataclasses.replace(
+                self.game.game_state, 
+                turn=currentTurn
+            )
             self.game.offer_received = False
 
-        async def update_asset(self, asset: Messages.Asset):
+        async def update_asset(self, asset: AssetModel):
             """Updates the information of a single asset
 
             :param asset: Asset to be changed
@@ -911,11 +1169,11 @@ class Game(EventBasedObject):
 
             if any([asset.id == a.id for a in self.game.game_state.assets_on_board]):
                 self._hide_asset(asset.id)
-                self._reveal_asset(map_message2model(asset))
+                self._reveal_asset(asset)
 
         async def set_received_offering(
                 self, 
-                actions: List[Messages.Action], 
+                actions: List[ActionModel], 
                 amount_selection: int
             ):
             """Sets the received offer the agent can choose from when redrawing
@@ -940,7 +1198,7 @@ class Game(EventBasedObject):
             self.game.game_state = dataclasses.replace(
                 self.game.game_state, 
                 selection_amount=amount_selection, 
-                selection_choices=map_message2model(actions)
+                selection_choices=actions
             )
             self.game.offer_received = True
 
@@ -953,11 +1211,42 @@ class Game(EventBasedObject):
                 }
             )
 
+        async def action_points_changed(self, actionPoints: int):
+            """Sets the action points of the agent
+
+            :param actionPoints: amount of action points the agent has
+            :raise RuntimeError: game state is None
+            :event action_points_changed: notifies all waiting tasks that a
+                'action_points_changed' event occured
+            """
+            await self._await_correct_game_storage_phase(
+                GameStoragePhase.Running
+            )
+            if self.game.game_state is None:
+                raise RuntimeError(
+                    "Cannot set action points if game state is not set"
+                )
+
+            # trap the second call in this if and let it await until the
+            # play_action function is finished
+            if self.game.play_action_finished.is_set():
+                self.game.play_action_finished.clear()
+                await self.game.play_action_finished.wait()
+
+            self.game.game_state = dataclasses.replace(
+                self.game.game_state, 
+                action_points=actionPoints
+            )
+
+            # set event let second call run into the if condition above
+            self.game.play_action_finished.set()
+            self.game.logger.debug(f"Action points changed to {actionPoints}")
+
         async def game_ended(
                 self,
-                endState: Messages.GameEndedState,
-                endMessage: str,
-                postGameSummary: Messages.PostGameSummary = None,
+                end_state: Messages.GameEndedState,
+                end_message: str,
+                post_game_summary: PostGameSummaryModel = None,
                 turn:int = None
             ):
             """Updates the game state accordingly for the ended game, sets
@@ -981,25 +1270,29 @@ class Game(EventBasedObject):
                 { 'game_storage_phase': self.game.phase }
             )
             self.game.game_state = dataclasses.replace(
-                self.game.game_state, 
-                end_state = map_message2model(endState)
+                self.game.game_state,
+                game_phase=GamePhase.Ended,
+                end_state = end_state
             )
-
+            self.game.logger.info(
+                f"Game ended in turn {self.game.game_state.turn}: {end_state} - "
+                f"{end_message}"
+            )
             # TODO: Log game end and results
             await self.game.dispatch_event(
-                Events.GAME_ENDED, 
+                Events.GAME_ENDED,
                 {
                     'role': self.game.get_player_role(),
-                    'result': endState,
-                    'finished_messages': endMessage,
+                    'result': end_state,
+                    'finished_messages': end_message,
                     'turn': turn if turn is not None else self.game.game_state.turn
                 }
             )
             self.game.interaction_buffer.put_nowait(GameInteractionType.END)
 
         async def error(
-                self, 
-                error_id:Union[int, List[int]], 
+                self,
+                error_id:Union[int, List[int]],
                 error_message: Union[str, List[str]],
                 multiple_errors: bool
             ):
@@ -1014,10 +1307,52 @@ class Game(EventBasedObject):
                 error_id = [error_id]
                 error_message = [error_message]
             for eid, emsg in zip(error_id, error_message):
-                get_logger(__name__).error(f"Error {eid}: {emsg}")
-            if self.game.phase.value > GameStoragePhase.Start.value:
-                await self.game.output.leave_game()
-                await self.game.close()
+                match eid:
+                    case Errors.InvalidGamePhase:
+                        # suppress error message if the game has ended
+                        # if the other player for example leaves the game then
+                        # the game ended message might come in between an action
+                        # and then a GamePhaseMismatch error is thrown, because
+                        # the game is already in the ended phase
+                        if self.game.phase != GameStoragePhase.Ended and \
+                            self.game.game_state.game_phase != GamePhase.Ended:
+                            self.game.logger.error(f"Error {eid}: {emsg}")
+                    case Errors.ActionNotPlayable:
+                        # Another task is waiting for the play_action_reply
+                        # event, so we need to send a reply in order to prevent 
+                        # an error
+                        
+                        await self.game.dispatch_event(
+                            Events.PLAY_ACTION_REPLY,
+                            {
+                                'successful': False,
+                                'action': None
+                            }
+                        )
+                    case Errors.NotEnoughCreditsError:
+                        if self.game.game_state.interaction_phase != GameInteractionPhase.Shopping:
+                            await self.game.dispatch_event(
+                                Events.PLAY_ACTION_REPLY, 
+                                { 
+                                    'successful': False,
+                                    'action': None
+                                }
+                            )
+                    case Errors.NoPlayableActionError:
+                        # Another task is waiting for the all_actions_playable
+                        # event, so we need to send an empty list of playable
+                        # actions in order to prevent an error
+                        await self.game.dispatch_event(
+                            Events.ALL_ACTIONS_PLAYABLE, 
+                            { 
+                                'playable_actions': []
+                            }
+                        )
+                    case _:
+                        self.game.logger.error(f"Error {eid}: {emsg}")
+                        if self.game.phase.value > GameStoragePhase.Start.value:
+                            await self.game.leave_game()
+                            await self.game.close()
 
         async def got_kicked(self):
             """Closes the game"""
@@ -1029,7 +1364,7 @@ class Game(EventBasedObject):
             new_player_id: int, 
             old_connection_id: str, 
             old_player_id: int, 
-            player: Player
+            player: PlayerModel
         ):
             """Updates information about a player
 
@@ -1039,9 +1374,13 @@ class Game(EventBasedObject):
             :param old_player_id: old ID of the player
             :param player: player object that holds more detailed information
             """
-            if self.game.actor_connection_id == old_connection_id:
-                self.game.actor_connection_id = new_connection_id
-            
+            if self.game.connection_id == old_connection_id:
+                self.game.connection_id = new_connection_id
+                if self.game.game_state is not None:
+                    self.game.game_state = dataclasses.replace(
+                        self.game.game_state, 
+                        connection_id=new_connection_id
+                    )
             
             idx = None
             # if a player with the old connection ID already exists, remove it
@@ -1057,7 +1396,7 @@ class Game(EventBasedObject):
                 idx = len(self.game.game_state.players)
             self.game.game_state.players.insert(idx, player)
 
-        async def update_game_state(self, game: Messages.Game):
+        async def update_game_state(self, game: GameModel):
             """Update the current game state via a full game state update from
             the PenQuest server
 
@@ -1067,24 +1406,25 @@ class Game(EventBasedObject):
             await self._await_correct_game_storage_phase(
                 GameStoragePhase.Running
             )
-            if self.game.actor_connection_id not in game.roles:
+            if self.game.connection_id not in game.roles:
                 raise RuntimeError("Didn't find role of this player in game")
 
 
-            self_actor = map_message2model(game.roles[self.game.actor_connection_id])
-            self.game.game_state = GameState(
-                actor_connection_id = self.game.actor_connection_id,
+            self_actor = game.roles[self.game.connection_id]
+            self.game.game_state = GameStateModel(
+                connection_id = self.game.connection_id,
                 turn=game.turn,
-                shop = map_message2model(game.shop),
+                shop = game.shop,
                 selection_amount = game.amount_selection,
-                phase=game.phase,
-                players=map_message2model(game.players),
-                roles=map_message2model(game.roles),
+                game_phase=game.phase,
+                players=game.players,
+                roles=game.roles,
                 hand=self_actor.actions,
                 equipment=self_actor.equipment,
                 assets_on_board=self_actor.visible_assets+self_actor.assets,
-                selection_choices=map_message2model(game.actions_offered)
+                selection_choices=game.actions_offered
             )
+            self.game.logger.info("Game state updated")
     
         async def game_left(self):
             """Forwards the event and to end the game gracefully
@@ -1117,15 +1457,15 @@ class Game(EventBasedObject):
                 {}
             )
             
-        async def join_lobby(self, code: str):
+        async def join_lobby(self, code: str, slot: int = None):
             """Sends a 'join_lobby' message
 
             :param code: code of the lobby to join to
             """
             await self.game.dispatch_command(
-                Commands.JOIN_LOBBY, 
-                MessageType.JOIN, 
-                OutboundMessages.JoinLobbyMessage(code)
+                Commands.JOIN_LOBBY,
+                MessageType.JOIN,
+                OutboundMessages.JoinLobbyMessage(code, slot=slot)
             )
 
         async def create_new_game_lobby(self):
@@ -1168,7 +1508,7 @@ class Game(EventBasedObject):
                 OutboundMessages.SelectScenarioMessage(scenario_id)
             )
 
-        async def update_game_options(self, options: GameOptions):
+        async def update_game_options(self, options: GameOptionsModel):
             """sends an update_game_options command
 
             :param options: new game options
@@ -1176,9 +1516,7 @@ class Game(EventBasedObject):
             await self.game.dispatch_command(
                 Commands.UPDATE_GAME_OPTIONS, 
                 MessageType.COMMAND, 
-                OutboundMessages.UpdateGameOptionsMessage(
-                    map_model2message(options)
-                )
+                OutboundMessages.UpdateGameOptionsMessage(options)
             )
 
         async def add_bot(self, slot: int, bot_type: int = 0):
@@ -1216,42 +1554,14 @@ class Game(EventBasedObject):
                 OutboundMessages.ChangeSlotMessage(new_slot)
             )
 
-        async def get_valid_actions(self, actions: List[Tuple[int,int,int]]):
-            """Sends a get_valid_actions message to see which actions can be
-            played in the current game state
-
-            :param actions: all actions under consideration
-            """
-            action_dicts = []
-
-            for action in actions:
-                action_dict = {
-                    "action_id": self.game.game_state.hand[action[0]].id,
-                    "support_action_ids": [],
-                    "equipment_ids": [],
-                }
-                if action[1] is not None and action[1] > 0:
-                    action_dict["support_action_ids"].append(
-                        self.game.game_state.hand[action[1]-1].id
-                    )
-                if action[2] is not None and action[2] > 0:
-                    action_dict["equipment_ids"].append(
-                        self.game.game_state.equipment[action[2]-1].id
-                    )
-                action_dicts.append(action_dict)
-            
-            await self.game.dispatch_command(
-                Commands.GET_VALID_ACTIONS, 
-                MessageType.COMMAND, 
-                OutboundMessages.GetValidActionsMessage(action_dicts)
-            )
-
         async def select_actions(self, action_ids: List[int]):
             """Sends a select_actions message"""
             await self.game.dispatch_command(
                 Commands.SELECT_ACTIONS, 
                 MessageType.COMMAND, 
-                OutboundMessages.SelectActionsMessage(action_ids)
+                OutboundMessages.SelectActionsMessage(
+                    [Messages.SelectedActionMessageModel(aid, 1) for aid in  action_ids]
+                )
             )
 
         async def play_action(
@@ -1289,10 +1599,17 @@ class Game(EventBasedObject):
                     action_id,
                     target_asset_id,
                     attack_mask,
-                    support_action_ids if support_action_ids else [],
-                    equipment_ids if equipment_ids else [],
+                    support_action_ids if support_action_ids is not None else [],
+                    equipment_ids if equipment_ids is not None else [],
                     response_target_id
                 )
+            )
+
+        async def finish_turn(self):
+            """Sends a finish_turn message"""
+            await self.game.dispatch_command(
+                Commands.GAME_TURN_FINISHED, 
+                MessageType.COMMAND
             )
 
         async def buy_equipment(self, equipment_ids: List[int]):
@@ -1308,16 +1625,17 @@ class Game(EventBasedObject):
                     endShopping=True
                 )
             )
-        
-        async def shopping_finished(self):
-            """Sends a shopping_finished message"""
-            await self.game.dispatch_command(
-                Commands.SHOPPING_FINISHED, 
-                MessageType.COMMAND
-            )
 
         async def surrender(self):
             """Sends a surrender message"""
+            # set the phase of the game to ended. Waiting for the reply of
+            # the server might take to long and the game might proceed with
+            # the next action in the meantime.
+            self.game.phase = GameStoragePhase.Ended
+            self.game.game_state = dataclasses.replace(
+                self.game.game_state,
+                game_phase=GamePhase.Ended,
+            )
             await self.game.dispatch_command(
                 Commands.SURRENDER, 
                 MessageType.COMMAND,
@@ -1331,19 +1649,80 @@ class Game(EventBasedObject):
                 MessageType.COMMAND
             )
 
+        async def send_preset_done(self):
+            """Sends a 'preset_done' message"""
+            await self.game.dispatch_command(
+                Commands.PRESET_DONE,
+                MessageType.COMMAND
+            )
+
+    async def _switch_to_play_card_git(self):
+        """Switches to the 'play card' game interaction type
+        
+        Before the game interaction type 'play card' can be published,
+        the game state needs to be updated for valid actions.
+        """
+        validated_actions = GameHelper.get_validated_play_actions(self.game_state)
+        self.game_state = dataclasses.replace(
+            self.game_state,
+            validated_actions=validated_actions
+        )
+        playable_actions = GameHelper.get_valid_actions(self.game_state)
+        # set the dataframe for all playable actions
+        df_playable_actions = pd.DataFrame(playable_actions)
+        self.game_state = dataclasses.replace(
+            self.game_state,
+            playable_actions=df_playable_actions
+        )
+        await self.dispatch_event(
+            Events.ALL_ACTIONS_PLAYABLE,
+            { 'playable_actions': playable_actions}
+        )
+        if len(playable_actions) == 0:
+            if self.game_state.actions_played_this_turn == 0:
+                await self._handle_no_playable_action()
+        # check if the current game state is still valid. There could be no
+        # valid actions anymore, however until the server sends a reply we
+        # already put the interaction type in the buffer if we don't check here
+        # again.
+        if self.game_state.game_phase != GamePhase.Ended:
+            self.interaction_buffer.put_nowait(
+                GameInteractionType.PLAY_CARD
+            )
+
+    async def _switch_to_redraw_git(self):
+        """Switches to the 'redraw' game interaction type
+
+        Before the game interaction type 'redraw' can be published, the game
+        state needs to be updated for valid actions.
+        """
+        validated_actions = GameHelper.get_validated_redraw_actions(self.game_state)
+        self.game_state = dataclasses.replace(
+            self.game_state,
+            validated_actions=validated_actions
+        )
+        if len(validated_actions) == 0:
+            raise PenQuestException(
+                Errors.NoPlayableActionError,
+                "There is no playable action to redraw"
+            )
+        if self.game_state.game_phase != GamePhase.Ended:
+            self.interaction_buffer.put_nowait(
+                GameInteractionType.CHOOSE_ACTION
+            )
 
     async def request_connection_id(self):
         """Requests a connection_id from the gateway and awaits until
         the ID was received
         """
-        if self.actor_connection_id is not None:
+        if self.connection_id is not None:
             raise Exception("Already received a connection id")
         
         await self.output.request_connection_id()
-        get_logger(__name__).debug("Request for a connection id was sent")
+        self.logger.debug("Request for a connection id was sent")
         await self.await_event(Events.CONNECTION_ID_RECEIVED)
 
-    async def join_game(self, game_id: str):
+    async def join_game(self, game_id: str, slot: int = None):
         """Joins an already existing lobby with the given id
 
         :param game_id: Id of the game lobby to join to
@@ -1351,21 +1730,22 @@ class Game(EventBasedObject):
         if self.phase != GameStoragePhase.Start:
             raise Exception("Cannot join game when game is not in start phase")
 
-        await self.output.join_lobby(game_id)
+        await self.output.join_lobby(game_id, slot=slot)
 
         # Ask for lobby changes and player readiness
-        self.interaction_buffer.put_nowait(GameInteractionType.CHANGE_LOBBY_PROPERTIES)
-        self.interaction_buffer.put_nowait(GameInteractionType.PLAYER_READY)
+        #self.interaction_buffer.put_nowait(GameInteractionType.CHANGE_LOBBY_PROPERTIES)
+        #self.interaction_buffer.put_nowait(GameInteractionType.PLAYER_READY)
 
     async def create_new_lobby(
-            self, 
+            self,
             scenario_id: Optional[int] = None, 
-            options: Optional[Dict[str, int]] = None
+            options: Optional[Union[GameOptionsModel,Dict[str, int]]] = None
         ):
         """Creates a lobby with the given lobby info
 
         :param scenario_id: Id of the scenario to select
-        :param options: Options to set for the game
+        :param options: Options to set for the game, that have key-values like
+            the structure of a GameOptions object
         :return: Lobby object
         :event game_storage_phase_changed: notifies all waiting tasks that a
             'game_storage_phase_changed' event occured
@@ -1380,7 +1760,12 @@ class Game(EventBasedObject):
             await self.output.select_scenario(scenario_id)
             await self.await_event(Events.SCENARIO_CHANGED)
         if options is not None:
-            game_options = GameOptions.from_dict(options)
+            if isinstance(options, dict):
+                game_options = GameOptionsModel.from_dict(options)
+            elif isinstance(options, GameOptionsModel):
+                game_options = options
+            else:
+                raise ValueError(f"unknown type '{type(options)}' for options")
             await self.output.update_game_options(game_options)
             await self.await_event(Events.GAME_OPTIONS_CHANGED)
         
@@ -1397,7 +1782,7 @@ class Game(EventBasedObject):
         self.interaction_buffer.put_nowait(GameInteractionType.PLAYER_READY)
 
         return ret
-    
+
     async def set_seed(self, seed: int):
         """Sets the seed of the game
 
@@ -1456,7 +1841,8 @@ class Game(EventBasedObject):
         if self.lobby is None:
             raise RuntimeError("Cannot wait for players when lobby is not set")
         
-        if amount <= 0: return
+        if amount <= 0: 
+            return
         while len(self.lobby.players) -1 < amount:
             await self.await_event(
                 Events.PLAYERS_CHANGED, 
@@ -1483,7 +1869,7 @@ class Game(EventBasedObject):
             )
 
         await self.output.set_player_readiness(ready)
-    
+  
     async def change_slot(self, new_slot: int):
         """Changes slot of the agent in the game lobby
 
@@ -1495,17 +1881,17 @@ class Game(EventBasedObject):
         
         await self.output.change_slot(new_slot)
         await self.await_event(Events.PLAYERS_CHANGED)
-        
-    async def get_curr_phase(self) -> ExternalGamePhase:
+    
+    async def get_curr_phase(self) -> GamePhase:
         """Returns the current phase of the game
 
         :return: Current phase of the game
         """
         if self.game_state is None:
-            return ExternalGamePhase.Starting
-        return self.game_state.external_phase
+            return GamePhase.Starting
+        return self.game_state.game_phase
 
-    def _is_my_turn(self, current_phase: ExternalGamePhase) -> bool:
+    def _is_my_turn(self, current_phase: GamePhase) -> bool:
         """Returns whether it is the current player's turn
 
         :param current_phase: Current phase of the game
@@ -1521,20 +1907,27 @@ class Game(EventBasedObject):
             raise RuntimeError("Cannot start game if game state is not set")
 
         role = self.get_player_role()
-        if role is None: return False
+        if role is None: 
+            return False
 
-        if current_phase not in [ExternalGamePhase.Attacker, ExternalGamePhase.Defender]:
+        if current_phase == GamePhase.InitDraw:
+            return True
+
+        if current_phase == GamePhase.DefenderPreSetup:
+            return role.type == ActorType.DEFENCE
+
+        if current_phase not in [GamePhase.Attacker, GamePhase.Defender]:
             return False
         
-        is_attacker = role.type == 'attacker' and current_phase == ExternalGamePhase.Attacker
-        is_defender = role.type == 'defender' and current_phase == ExternalGamePhase.Defender
+        is_attacker = role.type == ActorType.ATTACK and current_phase == GamePhase.Attacker
+        is_defender = role.type ==  ActorType.DEFENCE and current_phase == GamePhase.Defender
 
         return is_attacker or is_defender
 
     def get_player_role(
             self,
             connection_id: Optional[str] = None
-        ) -> Actor:
+        ) -> ActorModel:
         """Returns the role of the agent's player (None) or with the given 
         connection id
 
@@ -1545,10 +1938,10 @@ class Game(EventBasedObject):
             return None
 
         return self.game_state.roles.get(
-            connection_id or self.game_state.actor_connection_id,
+            connection_id or self.game_state.connection_id,
             None
         )
-    
+
     def set_player_role(self, role: Dict, connection_id: Optional[str] = None):
         """Sets the role of the agent's player (None) or with the given
         connection id
@@ -1559,10 +1952,10 @@ class Game(EventBasedObject):
         if self.game_state is None or self.game_state.roles is None:
             return None
         
-        id = connection_id or self.game_state.actor_connection_id
-        if id not in self.game_state.roles: return None
+        actor_id = connection_id or self.game_state.connection_id
+        if actor_id not in self.game_state.roles: return None
 
-        self.game_state.roles[id] = role
+        self.game_state.roles[actor_id] = role
 
     async def next_interaction_type(
             self,
@@ -1594,33 +1987,26 @@ class Game(EventBasedObject):
             raise RuntimeError("Cannot shop when game is not running")
         if self.game_state is None:
             raise RuntimeError("Cannot start game if game state is not set")
-        if self.game_state.internal_phase != InternalGamePhase.Shopping:
-            raise RuntimeError("Cannot shop outside the shopping phase")
-        if len(equipment_ids) == 0: return # Nothing to buy
+        if not GameInteraction.is_interaction_valid(self.game_state, GameInteractionType.SHOPPING_PHASE): 
+            raise RuntimeError(
+                f"Wrong interaction phase: current interaction phase is "
+                f"{self.game_state.interaction_phase} but a SHOPPING_PHASE "
+                "was detected"
+            )
 
-        await self.output.buy_equipment(equipment_ids)
+        if len(equipment_ids) > 0:
+            await self.output.buy_equipment(equipment_ids)
+            await self.await_events(
+                [Events.EQUIPMENT_CHANGED, Events.REMOVED_EQUIPMENT_FROM_SHOP]
+            )
 
-        self.game_state = dataclasses.replace(
-            self.game_state, 
-            internal_phase=InternalGamePhase.Playing
-        )
-        self.interaction_buffer.put_nowait(GameInteractionType.PLAY_CARD)
-
-    async def remove_equipment_from_shop(self, equipmentIds: List[str]):
-        """Removes equipment from the shop
-
-        :param eq_ids: List of equipment IDs to remove
-        """
-        if self.game_state is None:
-            raise RuntimeError("Cannot remove equipment if game state is not set")
-        if self.game_state.shop is None:
-            raise RuntimeError("Cannot remove equipment if shop is not set")
-
-        for eq_id in equipmentIds:
-            for eq in self.game_state.shop:
-                if eq.id == eq_id:
-                    self.game_state.shop.remove(eq)
-                    break
+        self.game_state = GameInteraction.move_from_shopping(self.game_state)
+        # next game interaction is PLAY_CARD
+        await self._switch_to_play_card_git()
+        
+        # important for GIRS in Bot to check whether the operation was succesful
+        # or it should select another action.
+        return True
 
     async def finish_shopping(self):
         """Finishs the shopping phase for the agent
@@ -1633,143 +2019,55 @@ class Game(EventBasedObject):
             raise RuntimeError("Cannot shop when game is not running")
         if self.game_state is None:
             raise RuntimeError("Cannot start game if game state is not set")
-        if self.game_state.internal_phase != InternalGamePhase.Shopping:
-            raise RuntimeError("Cannot shop outside the shopping phase")
-
-        await self.output.shopping_finished()
-
-        self.game_state = dataclasses.replace(
-            self.game_state, 
-            internal_phase=InternalGamePhase.Playing
-        )
-        self.interaction_buffer.put_nowait(GameInteractionType.PLAY_CARD)
-
-    async def get_valid_actions(self) -> List[Tuple[int,int,int,int,int,int]]:
-        """Returns a list of all valid actions currently available to the player
-
-        :raises RuntimeError: GameStoragePhase is not 'running'
-        :raises RuntimeError: game state is None
-        :raises RuntimeError: incorrect GamePhase
-        :raises RuntimeError: no playable actions
-        :return: list of all valid actions
-        """
-
-        if self.phase != GameStoragePhase.Running:
+        if not GameInteraction.is_interaction_valid(self.game_state, GameInteractionType.SHOPPING_PHASE): 
             raise RuntimeError(
-                "Cannot get valid actions when game is not running"
-                )
-        if self.game_state is None:
-            raise RuntimeError(
-                "Cannot get valid actions if game state is not set"
+                f"Wrong interaction phase: current interaction phase is "
+                f"{self.game_state.interaction_phase} but a SHOPPING_PHASE "
+                "was detected"
             )
-        if self._is_my_turn(self.game_state.external_phase) is False:
-            raise RuntimeError(
-                "Cannot get valid actions when it is not your turn"
-            )
+            
+        # No command for finishing shopping necessary anymore, as shopping is
+        # not an official game phase anymore. Only the next game interaction 
+        # changes.
 
-        all_action_combinations = self._get_all_action_combinatinations()
+        self.game_state = GameInteraction.move_from_shopping(self.game_state)
+        # next game interaction is PLAY_CARD
+        await self._switch_to_play_card_git()
         
-        # Send to gameserver to get only valid actions and await reply
-        await self.output.get_valid_actions(all_action_combinations)
-        response = await self.await_event(Events.ALL_ACTIONS_PLAYABLE)
-        playable_results = response.get('actions', {})
-
-        comb_generators = []
-        for i,result in playable_results.items():
-            if not result.playable:
-                continue
-            action_combination = all_action_combinations[i]
-            action = self.game_state.hand[action_combination[0]]
-            if action.target_type == "single":
-                target_asset_ids = result.possible_targets
-            else:
-                target_asset_ids = [0]
-            if result.possible_response_target_ids is not None and len(result.possible_response_target_ids) > 0:
-                response_target_ids = result.possible_response_target_ids 
-            else:
-                response_target_ids = { i: [0] for i in target_asset_ids}
-            if action.requires_attack_mask:
-                attack_masks = [1,2,3] # indices of ATTACK_MASKS
-            else:
-                attack_masks = [0] # index in ATTACK_MASKS
-
-            for target_asset_id in target_asset_ids:
-                asset_response_target_ids = response_target_ids[target_asset_id]
-                if asset_response_target_ids is None or len(asset_response_target_ids) == 0:
-                    asset_response_target_ids = [0]
-
-                comb_generators.append(
-                    itertools.chain.from_iterable(
-                        [
-                            itertools.product(
-                                [action_combination[0]], 
-                                [target_asset_id], 
-                                attack_masks, 
-                                [action_combination[1]], 
-                                [action_combination[2]], 
-                                asset_response_target_ids
-                            )
-                        ]
-                    )
-                )
-
-        playable_actions = tuple(itertools.chain.from_iterable(comb_generators))
-
-        if len(playable_actions) == 0:
-            get_logger(__name__).error("No playable action available")
-            await self.output.surrender()
-            await self.output.leave_game()
-        
-        return playable_actions
+        # important for GIRS in Bot to check whether the operation was succesful
+        # or it should select another action.
+        return True
     
-    def _get_all_action_combinatinations(self) -> List[Tuple[int,int, int]]:
-        """Returns all combinations of main actions, support actions, and 
-        equipment
-
-        :return: list of indices combinations
+    async def _handle_no_playable_action(self):
+        """Handles what to do (leaving) if no playable action remains for the 
+        agent to play
         """
-        # Exclude permanent equipments from validation
-        #TODO flag if its an permanent equipment 
-        perm_eq = [
-            "AttackTool",
-            "SecuritySystem",
-            "GlobalSingleUseDefenseEquipment",  # Types for covering edge cases
-            "GlobalSingleUseAttackEquipment",   # Types for covering edge cases
-        ]
-
-        main_action_idxs = [
-            index
-            for index, action in enumerate(self.game_state.hand)
-            if action.card_type == "main"
-        ]
-        support_action_idxs = [
-            index +1
-            for index, action in enumerate(self.game_state.hand)
-            if action.card_type == "support"
-        ]
-        support_action_idxs.append(0)
-        equipment_idxs = [
-            idx +1
-            for idx, data in enumerate(self.game_state.equipment)
-            if data.type not in perm_eq
-        ]
-        equipment_idxs.append(0)
-        
-        return list(
-            itertools.product(
-                main_action_idxs, 
-                support_action_idxs, 
-                equipment_idxs
-            ) 
-        )
+        error_msg = f"Error {Errors.NoPlayableActionError}: no playable action available"
+        if self.phase.value > GameStoragePhase.Start.value:
+            # if this happens during pre-setup, skip the entire pre-
+            # setup and continue the game
+            if self.game_state.game_phase == GamePhase.DefenderPreSetup:
+                self.logger.debug(error_msg)
+                # Sending "preset done" is done by the bot/env not here
+                # self.logger.debug("Skip pre-setup due to no other options")
+                # await self.output.send_preset_done()
+                # set offer_received back to False because preset is done and there
+                # is no 'new_turn' message if there is an InitialDraw
+                self.offer_received = False
+            else:
+                self.logger.error(error_msg)
+                self.logger.error("Surrender due to no other options")
+                await self.output.surrender()
+                await self.leave_game()
+                await self.close()
 
     async def play_action(
-        self, 
-        action_id: int, 
-        target_asset_id: int, 
-        attack_mask: str, 
-        support_action_ids: List[int] = None, 
-        equipment_ids: List[int] = None, 
+        self,
+        action_idx: int,
+        target_asset_id: int,
+        attack_mask_idx: int,
+        support_action_idxs: List[int] = None,
+        equipment_idxs: List[int] = None,
         response_target_id: int = 0
     ) -> bool:
         """Plays an action this contains an card (main action), target asset, 
@@ -1779,52 +2077,126 @@ class Game(EventBasedObject):
         :param target_asset_id: Id of the target asset
         :param attack_mask: Mode of attack that the action aims at. 
             Possible Values: "C", "I", "A", "CI", "CA", "CIA"
-        :param support_action_ids: List of support action ids
-        :param equipment_ids: List of equipment ids
+        :param support_action_ids: List of support action ids. Starts with 0.
+        :param equipment_ids: List of equipment ids. Starts with 0.
         :param response_target_id: Id of a previously played ID on the 
             target, the current main_action shall counter. Defaults to 0.
         """
-        if support_action_ids is None:
-            support_action_ids = []
-        if equipment_ids is None:
-            equipment_ids = []
+        if not GameInteraction.is_interaction_valid(self.game_state, GameInteractionType.PLAY_CARD):
+            raise RuntimeError(
+                f"Wrong interaction phase: current interaction phase is "
+                f"{self.game_state.interaction_phase} but a PLAY_CARD "
+                "was detected"
+            )
 
+        if support_action_idxs is None:
+            support_action_idxs = []
+        if equipment_idxs is None:
+            equipment_idxs = []
+
+        # clear the switch for action point setting so that the first message
+        # changes the action points
+        self.play_action_finished.clear()
+
+        main_action = self.game_state.hand[action_idx]
+        new_target_asset_id = target_asset_id if target_asset_id != 0 else None
+        attack_mask = VALID_ATTACK_MASKS[attack_mask_idx]
+        if attack_mask == "" and main_action.predefined_attack_mask is not None:
+            attack_mask = main_action.predefined_attack_mask
+        support_action_ids = [
+            self.game_state.hand[idx].id for idx in support_action_idxs
+        ]
+        equipment_ids = [
+            self.game_state.equipment[idx].id
+            for idx in equipment_idxs
+        ]
+
+        # send play action command to the server
         await self.output.play_action(
-            action_id, 
-            target_asset_id, 
-            attack_mask, 
-            support_action_ids, 
-            equipment_ids, 
+            main_action.id,
+            new_target_asset_id,
+            attack_mask,
+            support_action_ids,
+            equipment_ids,
             response_target_id
         )
-        action = await self.await_event(Events.PLAY_ACTION_REPLY)
-        ret = action.get('successful', False)
+        # await until the response of the server is received and executed
+        success_reply = await self.await_event(Events.PLAY_ACTION_REPLY)
+        successful = success_reply.get('successful', False)
 
+        self.logger.debug(
+            f"Play action {main_action.name} successful: {successful}"
+        )
         # no need to remove played actions here, PenQuest server sends a
         # separate message for that
 
         # TODO Debugging why?
-        if isinstance(ret, list):
-            if len(ret) == 0:
+        if isinstance(successful, list):
+            if len(successful) == 0:
                 # multi-targeted action didn't find any target 
-                ret = False 
+                successful = False
             else:
-                ret = ret[0]
-        return ret, action
-    
-    def has_to_select(self) -> bool:
-        """Returns whether the agent has to select an action
+                successful = successful[0]
 
-        :raises RuntimeError: GameStoragePhase is not 'running'
-        :raises RuntimeError: game state is None
-        :return: indicates whether the agent has to select an action
+        actions_played = self.game_state.actions_played_this_turn
+        self.game_state = dataclasses.replace(
+            self.game_state,
+            actions_played_this_turn=actions_played + 1
+        )
+
+        # In the last turn the turn is automatically finished afther the last
+        # action is played.
+        if self.game_state.role.ini == 1 and self.game_state.action_points == 0:
+            await self.await_event(Events.PLAYER_ATTRIBUTE_CHANGED)
+
+        # add another play card interaction to the buffer because players
+        # can play multiple actions unless they chose to finish their turn
+        # or they don't have enough action points anymore (especially in the
+        # last turn!).
+        if self.game_state.action_points > ActorHelper.get_min_aps(self.game_state.role):
+            await self._switch_to_play_card_git()
+
+        # free all waiting tasks to set new action points
+        self.play_action_finished.set()
+        # clear the switch so that the next message for action point updates
+        # can set the changes between action plays
+        self.play_action_finished.clear()
+
+        return successful
+    
+    async def finish_turn(self):
+        """Finishes the current game turn by sending a corresponding signal
+        to the game server.
         """
-        if self.phase != GameStoragePhase.Running:
-            raise RuntimeError("Cannot select when game is not running")
-        if self.game_state is None:
-            raise RuntimeError("Cannot start game if game state is not set")
-        
-        return self.game_state.selection_amount > 0 and len(self.game_state.selection_choices) > 0
+        if not GameInteraction.is_interaction_valid(self.game_state, GameInteractionType.PLAY_CARD):
+            raise RuntimeError(
+                f"Wrong interaction phase: current interaction phase is "
+                f"{self.game_state.interaction_phase} but a PLAY_CARD "
+                "was detected"
+            )
+
+        self.shop_updated = False
+        if self.game_state.game_phase == GamePhase.DefenderPreSetup:
+            await self.output.send_preset_done()
+            # set offer_received back to False because preset is done and there
+            # is no 'new_turn' message if there is an InitialDraw
+            self.offer_received = False
+        else:
+            await self.output.finish_turn()
+        self.game_state = dataclasses.replace(
+                self.game_state,
+                validated_actions=None,
+                playable_actions=None,
+                actions_played_this_turn=0
+            )
+
+        # clear the switch 
+        # in a regular case, a second message might flip the switch and if no
+        # action is then played, then a regular ap update message gets trapped
+        # in the switch
+        self.play_action_finished.clear() 
+
+        return True
 
     def get_selection(self) -> Tuple[int, List]:
         """returns the amount and a list of possible actions the agent can
@@ -1839,7 +2211,7 @@ class Game(EventBasedObject):
             raise RuntimeError("Cannot select when game is not running")
         if self.game_state is None:
             raise RuntimeError("Cannot start game if game state is not set")
-        if not self.has_to_select():
+        if self.game_state.interaction_phase != GameInteractionType.CHOOSE_ACTION:
             raise RuntimeError(
                 "Cannot get selection when player doesn't have to select"
             )
@@ -1858,26 +2230,48 @@ class Game(EventBasedObject):
             raise RuntimeError("Cannot select actions when game is not running")
         if self.game_state is None:
             raise RuntimeError("Cannot select actions if game state is not set")
-        if not self.has_to_select():
+        if not GameInteraction.is_interaction_valid(self.game_state, GameInteractionType.CHOOSE_ACTION):
             raise RuntimeError(
-                "Cannot select when player doesn't have to select"
+                f"Wrong interaction phase: current interaction phase is "
+                f"{self.game_state.interaction_phase} but a CHOOSE_ACTION "
+                "was detected"
+            )
+        if not (self.game_state.selection_amount > 0 and len(self.game_state.selection_choices) > 0):
+            raise RuntimeError(
+                "Cannot select when player doesn't have anything to select from"
             )
 
         # Make selection and reset game state selection
         await self.output.select_actions(action_ids)
+        await self.await_event(Events.ACTIONS_RECEIVED)
         self.game_state = dataclasses.replace(
             self.game_state, 
-            selection_amount=0, 
+            selection_amount=-1,
             selection_choices=[]
         )
+        # shop updates only during the game. If there is a defender pre-setup
+        # then the shop was already sent at the beginning of the game, so no
+        # need to wait for that event
+        if self.game_state.game_options.equipment_shop_mode != EquipmentShopMode.DISABLED and \
+            self.game_state.game_phase not in [GamePhase.DefenderPreSetup, GamePhase.InitDraw]:
+            if not self.shop_updated:
+                await self.await_event(Events.SHOP_UPDATED)
+        self.game_state = GameInteraction.move_from_redrawing(self.game_state)
 
-        # Turn counter increases by one
-        self.game_state = dataclasses.replace(
-            self.game_state, 
-            turn=self.game_state.turn + 1
-        )
+        if self._is_my_turn(self.game_state.game_phase) and \
+            self.game_state.game_phase != GamePhase.InitDraw:
+            if self.game_state.game_options.equipment_shop_mode > 0:
+                self.interaction_buffer.put_nowait(
+                    GameInteractionType.SHOPPING_PHASE
+                )
+            else:
+                await self._switch_to_play_card_git()
 
-    async def do_nothing(*args, **kwargs):
+        # important for GIRS in Bot to check whether the operation was succesful
+        # or it should select another action.
+        return True
+
+    async def do_nothing(self, *args, **kwargs):
         """Does literally nothing"""
         pass
 
@@ -1886,14 +2280,14 @@ class Game(EventBasedObject):
 
         :param connectionId: the new connection ID to be set
         """
-        get_logger(__name__).debug(
+        self.logger.debug(
             f"updated connection_id to: '{connectionId}'"
         )
-        self.actor_connection_id = connectionId
+        self.connection_id = connectionId
         if self.game_state is not None:
             self.game_state = dataclasses.replace(
-                self.game_state, 
-                actor_connection_id=connectionId
+                self.game_state,
+                connection_id=connectionId
             )
         await self.dispatch_event(Events.CONNECTION_ID_RECEIVED)
 
@@ -1905,13 +2299,18 @@ class Game(EventBasedObject):
         """
         if self.lobby is None and self.game_state is None:
             raise RuntimeError("Nothing to leave")
+
+        # only leave game if there was not already a leave game sent
+        if self.leave_game_sent:
+            return
+
+        self.leave_game_sent = True
         await self.output.leave_game()
         await self.await_event(Events.GAME_LEFT)
-        
+
     def is_over(self) -> bool:
         """Indicates whether the current game is over or not
 
         :return: game over flag
         """
         return self.phase == GameStoragePhase.Ended
-    

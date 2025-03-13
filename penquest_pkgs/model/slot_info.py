@@ -1,8 +1,8 @@
 from dataclasses import dataclass
 
 @dataclass()
-class SlotInfo():
-    slotId :int
-    name :str
-    type :int
-    isReady :bool
+class SlotInfoModel():
+    slot_id: int
+    name: str
+    type: int
+    is_ready: bool

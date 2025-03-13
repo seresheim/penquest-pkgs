@@ -2,39 +2,52 @@
 from dataclasses import dataclass
 from typing import List
 
-from penquest_pkgs.model.action import Action
-from penquest_pkgs.model.asset import Asset
-from penquest_pkgs.model.equipment import Equipment
-from penquest_pkgs.model.goal import Goal
+from penquest_pkgs.model import (
+    EquipmentModel,
+    ActionModel,
+    AssetModel,
+    GoalModel
+)
+
+from penquest_pkgs.constants import ActorType
 
 
 @dataclass()
-class Actor():
+class ActorModel():
     id: str
-    type :str
-    name :str
-    description :str = None
-    soph :int = None
-    det :int = None
-    wealth :int = None
-    ini :int = None
-    ins :int = None
-    credits :float = None
-    online :bool = None
-    user_id :str = None
-    connection_id :str = None
-    avatar_id :str = None
-    visible_assets :List[Asset] = None
-    mission_description :str = None
-    goal_descriptions :List[str] = None
-    actions :List[Action] = None
-    goals :List[Goal] = None
-    assets :List[Asset] = None
-    equipment :List[Equipment] = None
-    hasBeenDetected :bool = None
-    insightShield: int = 0
-
+    type: int
+    name: str
+    action_points: int
+    connection_id: str = None
+    user_id: str = None
+    avatar_id: str = None
+    online: bool = None
+    description: str = None
+    soph: int = None
+    det: int = None
+    wealth: int = None
+    ins: int = None
+    ini: int = None
+    credits: float = None
+    insight_shield: int = None
+    actions: List[ActionModel] = None
+    equipment: List[EquipmentModel] = None
+    visible_assets: List[AssetModel] = None
+    goal_description: str = None
+    mission_description: str = None
+    goals: List[List[GoalModel]] = None
+    assets: List[AssetModel] = None
+    has_been_detected: bool = None
+    
     def __eq__(self, other):
-        if not isinstance(other, Actor):
+        if not isinstance(other, ActorModel):
             return False
         return self.id == other.id
+
+    @property
+    def is_attacker(self):
+        return self.type == ActorType.ATTACK
+
+    @property
+    def is_defender(self):
+        return self.type == ActorType.DEFENCE
