@@ -1983,6 +1983,7 @@ class Game(EventBasedObject):
         :raises RuntimeError: game state is None
         :raises RuntimeError: GamePhase is not 'shopping'
         """
+        self.logger.debug(f"Start interaction 'buying'")
         if self.phase != GameStoragePhase.Running:
             raise RuntimeError("Cannot shop when game is not running")
         if self.game_state is None:
@@ -2004,6 +2005,7 @@ class Game(EventBasedObject):
         # next game interaction is PLAY_CARD
         await self._switch_to_play_card_git()
         
+        self.logger.debug(f"Finished interaction 'buying'")
         # important for GIRS in Bot to check whether the operation was succesful
         # or it should select another action.
         return True
@@ -2015,6 +2017,7 @@ class Game(EventBasedObject):
         :raises RuntimeError: game state is None
         :raises RuntimeError: GamePhase is not 'shopping'
         """
+        self.logger.debug(f"Start interaction 'buying'")
         if self.phase != GameStoragePhase.Running:
             raise RuntimeError("Cannot shop when game is not running")
         if self.game_state is None:
@@ -2034,6 +2037,7 @@ class Game(EventBasedObject):
         # next game interaction is PLAY_CARD
         await self._switch_to_play_card_git()
         
+        self.logger.debug(f"Finished interaction 'buying'")
         # important for GIRS in Bot to check whether the operation was succesful
         # or it should select another action.
         return True
@@ -2082,6 +2086,8 @@ class Game(EventBasedObject):
         :param response_target_id: Id of a previously played ID on the 
             target, the current main_action shall counter. Defaults to 0.
         """
+        if self.game_state.actions_played_this_turn == 0:
+            self.logger.debug("start interaction 'playing'")
         if not GameInteraction.is_interaction_valid(self.game_state, GameInteractionType.PLAY_CARD):
             raise RuntimeError(
                 f"Wrong interaction phase: current interaction phase is "
@@ -2196,27 +2202,8 @@ class Game(EventBasedObject):
         # in the switch
         self.play_action_finished.clear() 
 
+        self.logger.debug(f"finished interaction 'playing'")
         return True
-
-    def get_selection(self) -> Tuple[int, List]:
-        """returns the amount and a list of possible actions the agent can
-        choose from
-
-        :raises RuntimeError: GameStoragePhase is not 'running'
-        :raises RuntimeError: game state is None
-        :raises RuntimeError: agent doesn't have to select anything
-        :return: amount and possible choices of the selection
-        """
-        if self.phase != GameStoragePhase.Running:
-            raise RuntimeError("Cannot select when game is not running")
-        if self.game_state is None:
-            raise RuntimeError("Cannot start game if game state is not set")
-        if self.game_state.interaction_phase != GameInteractionType.CHOOSE_ACTION:
-            raise RuntimeError(
-                "Cannot get selection when player doesn't have to select"
-            )
-        
-        return (self.game_state.selection_amount, self.game_state.selection_choices)
     
     async def selection_choose(self, action_ids: List):
         """the agents selection is forwarded to the PenQuest server
@@ -2226,6 +2213,7 @@ class Game(EventBasedObject):
         :raises RuntimeError: game state is None
         :raises RuntimeError: agent doesn't have to select anything
         """
+        self.logger.debug("start interaction 'redrawing'")
         if self.phase != GameStoragePhase.Running:
             raise RuntimeError("Cannot select actions when game is not running")
         if self.game_state is None:
@@ -2267,6 +2255,7 @@ class Game(EventBasedObject):
             else:
                 await self._switch_to_play_card_git()
 
+        self.logger.debug("finished interaction 'redrawing'")
         # important for GIRS in Bot to check whether the operation was succesful
         # or it should select another action.
         return True

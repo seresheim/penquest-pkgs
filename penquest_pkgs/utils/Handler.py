@@ -59,13 +59,12 @@ class EventBasedObject:
             self.event_listener.remove(listener)
 
     async def await_events(
-            self, 
-            events: List[str], 
+            self,
+            events: List[str],
             timeout: Optional[float]=30
         ):
-        """Awaits multiple events after each other. The order of the events is
-        important as events have to appear in the order as they are given to
-        this function and 'a little' time needs to appear between them.
+        """Awaits multiple events concurrently. The order of the events does not
+        matter.
 
         :param events: _description_
         :param timeout: _description_, defaults to 30
@@ -87,9 +86,10 @@ class EventBasedObject:
             event_listeners[event] = listener
 
         try:
-            ret_value = None
-            for event, reply in zip(events, replies):
-                ret_value = await asyncio.wait_for(reply, timeout)
+            results = asyncio.gather(
+                *[asyncio.wait_for(reply, timeout) for reply in replies]
+            )
+            return results
         except asyncio.TimeoutError:
             raise asyncio.TimeoutError(
                 f"Timeout reached while waiting for event: '{event}'"
@@ -97,4 +97,3 @@ class EventBasedObject:
         finally:
             for event in events:
                 self.event_listener.remove(event_listeners[event])
-            return ret_value

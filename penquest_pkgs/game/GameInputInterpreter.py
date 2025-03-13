@@ -289,7 +289,6 @@ class GameInputInterpreter:
             logger.warning(
                 f"Unknown event '{event}' received. With data: {data}"
             )
-        self.game.logger.debug(f"handle {event} message")
         # Create a separate task for each message handling, because then
         # messages can await for the arrival of other messages first. Otherwise
         # the single task that handles all messages is blocked by the waiting
@@ -309,6 +308,7 @@ class GameInputInterpreter:
         :param event: name of the event that needs handling
         :param message_dict: message that should be handled
         """
+        self.game.logger.debug(f"handle message '{event}'")
         try:
             mapped_message = EVENT_MAPPERS[event].map(message_obj)
             mapped_message_dict = {
@@ -329,6 +329,8 @@ class GameInputInterpreter:
                 f"Error while interpreting event '{event}': {e}"
             )
             traceback.print_exc()
+        finally:
+            self.game.logger.debug(f"finished handling '{event}'")
         
 
 
