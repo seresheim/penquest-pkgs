@@ -2,7 +2,7 @@ from setuptools import setup, find_namespace_packages
 
 setup(
     name='penquest-pkgs',
-    version='0.2.0',
+    version='0.2.2',
     description='Holds common models, constants, etc. of the PenQuest project',
     author='Sebastian Eresheim, Alexander Piglmann, Simon Gmeiner, Thomas Petelin',
     author_email="sebastian.eresheim@fhstp.a.at",

@@ -9,7 +9,7 @@ class GoalModel():
     type: int
     asset: AssetModel
     damage: DamageModel
-    attack_stage: str = None
+    attack_stage: int = None
     credits: float = None
     defender: int = None
     exposed: List[bool] = None

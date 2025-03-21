@@ -271,7 +271,7 @@ class AssetMessageModel():
 class GoalMessageModel():
     type: str = Required(str)
     asset: AssetMessageModel = Optional(AssetMessageModel)
-    attack_stage: str = Optional(str, nullable=True)
+    attack_stage: int = Optional(int, nullable=True)
     credits: float = Optional(float, nullable=True)
     damage: List[int] = Optional(List[int])
     defender: int = Optional(int, nullable=True)
